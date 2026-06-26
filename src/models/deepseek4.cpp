@@ -193,6 +193,12 @@ enum class dsv4_mask_kind {
     RAW_WINDOW,
     COMPRESS_CAUSAL,
     ATTN_STATIC,
+    // Like COMPRESS_CAUSAL but the tensor width (ne[0] = NC_FIXED) is a depth-
+    // INVARIANT constant: rows [0, n_comp_visible) get the causal 0, rows
+    // [n_comp_visible, NC_FIXED) stay -INF. Its can_reuse never fails on depth,
+    // so the decode CUDA graph can REPLAY across compression boundaries instead
+    // of recapturing every `ratio` tokens. Pairs with a fixed-width cache view.
+    COMPRESS_FIXED,
 };
 
 struct dsv4_mask_entry {
@@ -213,6 +219,16 @@ struct dsv4_index_entry {
     int64_t       ratio  = 0;
     int64_t       base   = 0;
 };
+
+// Feature flag (env DSV4_CONSTANT_SHAPE): build the decode compressed-attention
+// path with a depth-INVARIANT shape+topology so the CUDA graph REPLAYS across
+// compression boundaries at all depths (instead of recapturing every `ratio`
+// tokens, which makes graphs-on slower than graphs-off past ~250 tokens). Off
+// by default until validated.
+static bool dsv4_constant_shape_enabled() {
+    static const bool v = getenv("DSV4_CONSTANT_SHAPE") != nullptr;
+    return v;
+}
 
 class dsv4_graph_inputs : public llm_graph_input_i {
 public:
@@ -281,6 +297,11 @@ public:
                 case dsv4_mask_kind::COMPRESS_CAUSAL:
                     fill_compress_causal(data, n0, n1, mask.ratio, 0, ubatch);
                     break;
+                case dsv4_mask_kind::COMPRESS_FIXED:
+                    // Fixed width: causal 0 for [0, n_comp_visible), the rest of
+                    // [0, NC_FIXED) stays -INF (the data() init). Same fill logic.
+                    fill_compress_causal(data, n0, n1, mask.ratio, 0, ubatch);
+                    break;
                 case dsv4_mask_kind::ATTN_STATIC:
                     fill_raw_window(data, n0, n1, mask.window, ubatch);
                     fill_compress_causal(data, n0, n1, mask.ratio, mask.n_raw, ubatch);
@@ -313,6 +334,9 @@ public:
                 case dsv4_mask_kind::RAW_WINDOW:      want_n0 = nt;       break;
                 case dsv4_mask_kind::COMPRESS_CAUSAL: want_n0 = ncv;      break;
                 case dsv4_mask_kind::ATTN_STATIC:     want_n0 = nt + ncv; break;
+                // Fixed-width mask: ne[0] is a depth-invariant constant, so it
+                // always matches itself -> never blocks reuse on depth.
+                case dsv4_mask_kind::COMPRESS_FIXED:  want_n0 = m.tensor->ne[0]; break;
                 default:                              return false;
             }
             if (m.tensor->ne[0] != want_n0) {
@@ -1466,7 +1490,21 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 attn_mask = inp_attn->self_kq_mask_swa;
 
                 if (n_comp_visible > 0) {
-                    ggml_tensor * kv_comp_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), n_comp_visible);
+                    ggml_tensor * attn_k_cache = mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id);
+                    // Constant-shape decode: view a fixed NC_FIXED rows of the
+                    // (zero-initialized, capacity n_ctx/ratio) compressed-K cache so
+                    // k_all and the comp mask are depth-INVARIANT -> the decode CUDA
+                    // graph replays across compression boundaries instead of
+                    // recapturing every `ratio` tokens. Rows [n_comp_visible,
+                    // NC_FIXED) are zero (cache cleared at alloc) and masked to -INF.
+                    // Only for the ratio-4, single-token, <=top_k regime (the
+                    // measured-collapse band, ctx up to ~2048); beyond that the
+                    // variable top-k gather path takes over.
+                    const int64_t nc_fixed = std::min<int64_t>(hparams.indexer_top_k, attn_k_cache->ne[1]);
+                    const bool use_const_shape = dsv4_constant_shape_enabled()
+                        && compress_ratio == 4 && n_tokens == 1 && n_comp_visible <= nc_fixed;
+                    const int64_t nc_view = use_const_shape ? nc_fixed : n_comp_visible;
+                    ggml_tensor * kv_comp_cache = dsv4_cache_view_3d(ctx0, attn_k_cache, nc_view);
                     // V4's KV cache is F16 (forced via llama-model.cpp). CUDA's
                     // ggml_concat now supports F16 directly (ggml-cuda/concat.cu),
                     // so concat the two F16 KV segments without the F16->F32->F16
@@ -1533,8 +1571,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
                         if (n_tokens == 1 && n_comp_visible <= hparams.indexer_top_k) {
                             comp_mask = get_dsv4_inputs()->add_mask(ctx0,
-                                    dsv4_mask_kind::COMPRESS_CAUSAL,
-                                    n_comp_visible, n_tokens,
+                                    use_const_shape ? dsv4_mask_kind::COMPRESS_FIXED
+                                                    : dsv4_mask_kind::COMPRESS_CAUSAL,
+                                    use_const_shape ? nc_fixed : n_comp_visible, n_tokens,
                                     0, n_comp_visible, 0, compress_ratio,
                                     "dsv4_attn_compress_mask");
                         } else {
