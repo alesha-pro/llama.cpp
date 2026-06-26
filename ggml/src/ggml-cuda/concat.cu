@@ -1,16 +1,16 @@
 #include "concat.cuh"
 
 // contiguous kernels
-template <int dim>
-static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_f32_cont(const float * x,
-                                                                                 const float * y,
-                                                                                 float *       dst,
-                                                                                 int64_t       ne00,
-                                                                                 int64_t       ne01,
-                                                                                 int64_t       ne02,
-                                                                                 int64_t       ne0,
-                                                                                 int64_t       ne1,
-                                                                                 int64_t       ne2) {
+template <typename T, int dim>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_cont(const T * x,
+                                                                             const T * y,
+                                                                             T *       dst,
+                                                                             int64_t   ne00,
+                                                                             int64_t   ne01,
+                                                                             int64_t   ne02,
+                                                                             int64_t   ne0,
+                                                                             int64_t   ne1,
+                                                                             int64_t   ne2) {
     static_assert(dim >= 0 && dim <= 2, "dim must be in [0, 2]");
 
     const int64_t n = ne0 * ne1 * ne2;
@@ -49,37 +49,38 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_f32_cont
     }
 }
 
-static void concat_f32_cuda(const float * x,
-                            const float * y,
-                            float *       dst,
-                            int64_t       ne00,
-                            int64_t       ne01,
-                            int64_t       ne02,
-                            int64_t       ne0,
-                            int64_t       ne1,
-                            int64_t       ne2,
-                            int           dim,
-                            cudaStream_t  stream) {
+template <typename T>
+static void concat_cont_cuda(const T *    x,
+                             const T *    y,
+                             T *          dst,
+                             int64_t      ne00,
+                             int64_t      ne01,
+                             int64_t      ne02,
+                             int64_t      ne0,
+                             int64_t      ne1,
+                             int64_t      ne2,
+                             int          dim,
+                             cudaStream_t stream) {
     const int64_t n          = ne0 * ne1 * ne2;
     const int     num_blocks = (n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
 
     if (dim == 0) {
-        concat_f32_cont<0>
+        concat_cont<T, 0>
             <<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
         return;
     }
     if (dim == 1) {
-        concat_f32_cont<1>
+        concat_cont<T, 1>
             <<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
         return;
     }
-    concat_f32_cont<2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
+    concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
 }
 
 // non-contiguous kernel (slow)
-template <int dim>
+template <typename T, int dim>
 static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
-    concat_f32_non_cont(
+    concat_non_cont(
         const char * src0,
         const char * src1,
               char * dst,
@@ -113,29 +114,64 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     const int64_t i2 = blockIdx.y;
     const int64_t i1 = blockIdx.x;
 
-    const float * x;
+    const T * x;
 
     for (int64_t i0 = threadIdx.x; i0 < ne0; i0 += blockDim.x) {
         if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-            x = (const float *)(src0 + (i3       )*nb03 + (i2       )*nb02 + (i1       )*nb01 + (i0       )*nb00);
+            x = (const T *)(src0 + (i3       )*nb03 + (i2       )*nb02 + (i1       )*nb01 + (i0       )*nb00);
         } else {
             if constexpr (dim == 0) {
-                x = (const float *) (src1 + i3 * nb13 + i2 * nb12 + i1 * nb11 + (i0 - ne00) * nb10);
+                x = (const T *) (src1 + i3 * nb13 + i2 * nb12 + i1 * nb11 + (i0 - ne00) * nb10);
             } else if constexpr (dim == 1) {
-                x = (const float *) (src1 + i3 * nb13 + i2 * nb12 + (i1 - ne01) * nb11 + i0 * nb10);
+                x = (const T *) (src1 + i3 * nb13 + i2 * nb12 + (i1 - ne01) * nb11 + i0 * nb10);
             } else if constexpr (dim == 2) {
-                x = (const float *) (src1 + i3 * nb13 + (i2 - ne02) * nb12 + i1 * nb11 + i0 * nb10);
+                x = (const T *) (src1 + i3 * nb13 + (i2 - ne02) * nb12 + i1 * nb11 + i0 * nb10);
             } else if constexpr (dim == 3) {
-                x = (const float *) (src1 + (i3 - ne03) * nb13 + i2 * nb12 + i1 * nb11 + i0 * nb10);
+                x = (const T *) (src1 + (i3 - ne03) * nb13 + i2 * nb12 + i1 * nb11 + i0 * nb10);
             }
         }
 
-        float * y = (float *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+        T * y = (T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
 
         *y = *x;
     }
 }
 
+template <typename T>
+static void concat_non_cont_cuda(const ggml_tensor * src0,
+                                 const ggml_tensor * src1,
+                                 ggml_tensor *       dst,
+                                 int                 dim,
+                                 cudaStream_t        stream) {
+    dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
+    auto launch_kernel = [&](auto dim_c) {
+        concat_non_cont<T, dim_c><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+            (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+            src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+            src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+            src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+            src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+            dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+            dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+    };
+    switch (dim) {
+        case 0:
+            launch_kernel(std::integral_constant<int, 0>{});
+            break;
+        case 1:
+            launch_kernel(std::integral_constant<int, 1>{});
+            break;
+        case 2:
+            launch_kernel(std::integral_constant<int, 2>{});
+            break;
+        case 3:
+            launch_kernel(std::integral_constant<int, 3>{});
+            break;
+        default:
+            GGML_ABORT("Invalid dim: %d", dim);
+            break;
+    }
+}
 
 void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
@@ -145,60 +181,46 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const int32_t dim = ((int32_t *) dst->op_params)[0];
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    // F32 is the common case (mul_mat/norm/rope outputs). F16 is needed by
+    // DeepSeek-V4 decode, which concatenates the F16 KV cache directly instead
+    // of round-tripping through F32. All three tensors must share one type.
+    GGML_ASSERT(src0->type == src1->type);
+    GGML_ASSERT(src0->type == dst->type);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
 
     if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
-        const float * src0_d = (const float *)src0->data;
-        const float * src1_d = (const float *)src1->data;
-
-        float * dst_d = (float *)dst->data;
-
         if (dim != 3) {
             for (int i3 = 0; i3 < dst->ne[3]; i3++) {
-                concat_f32_cuda(
-                        src0_d + i3 * (src0->nb[3] / 4),
-                        src1_d + i3 * (src1->nb[3] / 4),
-                        dst_d + i3 * ( dst->nb[3] / 4),
-                        src0->ne[0], src0->ne[1], src0->ne[2],
-                        dst->ne[0],  dst->ne[1],  dst->ne[2], dim, stream);
+                const char * src0_d = (const char *) src0->data + i3 * src0->nb[3];
+                const char * src1_d = (const char *) src1->data + i3 * src1->nb[3];
+                char *       dst_d  = (char *)       dst->data  + i3 * dst->nb[3];
+
+                if (dst->type == GGML_TYPE_F16) {
+                    concat_cont_cuda<half>(
+                            (const half *) src0_d, (const half *) src1_d, (half *) dst_d,
+                            src0->ne[0], src0->ne[1], src0->ne[2],
+                            dst->ne[0],  dst->ne[1],  dst->ne[2], dim, stream);
+                } else {
+                    concat_cont_cuda<float>(
+                            (const float *) src0_d, (const float *) src1_d, (float *) dst_d,
+                            src0->ne[0], src0->ne[1], src0->ne[2],
+                            dst->ne[0],  dst->ne[1],  dst->ne[2], dim, stream);
+                }
             }
         } else {
             const size_t size0 = ggml_nbytes(src0);
             const size_t size1 = ggml_nbytes(src1);
 
-            CUDA_CHECK(cudaMemcpyAsync(dst_d,           src0_d, size0, cudaMemcpyDeviceToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(dst_d + size0/4, src1_d, size1, cudaMemcpyDeviceToDevice, stream));
+            char * dst_d = (char *) dst->data;
+
+            CUDA_CHECK(cudaMemcpyAsync(dst_d,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(dst_d + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
         }
     } else {
-        dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
-        auto launch_kernel = [&](auto dim) {
-            concat_f32_non_cont<dim><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
-                (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
-                src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
-                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
-                src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
-                src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
-                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-                dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
-        };
-        switch (dim) {
-            case 0:
-                launch_kernel(std::integral_constant<int, 0>{});
-                break;
-            case 1:
-                launch_kernel(std::integral_constant<int, 1>{});
-                break;
-            case 2:
-                launch_kernel(std::integral_constant<int, 2>{});
-                break;
-            case 3:
-                launch_kernel(std::integral_constant<int, 3>{});
-                break;
-            default:
-                GGML_ABORT("Invalid dim: %d", dim);
-                break;
+        if (dst->type == GGML_TYPE_F16) {
+            concat_non_cont_cuda<half>(src0, src1, dst, dim, stream);
+        } else {
+            concat_non_cont_cuda<float>(src0, src1, dst, dim, stream);
         }
     }
 }

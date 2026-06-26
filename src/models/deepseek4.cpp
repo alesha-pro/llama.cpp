@@ -204,6 +204,16 @@ struct dsv4_mask_entry {
     int64_t         ratio = 0;
 };
 
+// A per-token scalar index fed as a graph INPUT (refreshed every token by
+// set_input). Used to replace position-derived view offsets that would
+// otherwise be baked into the graph at build time (and go stale on graph
+// reuse). value = base + (last_pos % ratio).
+struct dsv4_index_entry {
+    ggml_tensor * tensor = nullptr;
+    int64_t       ratio  = 0;
+    int64_t       base   = 0;
+};
+
 class dsv4_graph_inputs : public llm_graph_input_i {
 public:
     ggml_tensor * add_mask(
@@ -223,7 +233,36 @@ public:
         return t;
     }
 
+    // Create a 1-element i32 input holding `base + (last_pos % ratio)`, refreshed
+    // every token. Replaces baked position-derived view offsets so the graph can
+    // be reused across tokens (CUDA graph replay) while still indexing correctly.
+    ggml_tensor * add_index(ggml_context * ctx, int64_t ratio, int64_t base, const char * name) {
+        // Dedup by (ratio, base): every layer/compressor with the same compress
+        // ratio needs the SAME per-token index value, so share one input tensor
+        // across all of them. Otherwise we'd create O(n_layers) inputs and blow
+        // past GGML_SCHED_MAX_SPLIT_INPUTS.
+        for (const auto & ie : indices) {
+            if (ie.ratio == ratio && ie.base == base) {
+                return ie.tensor;
+            }
+        }
+        ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_input(t);
+        ggml_set_name(t, name);
+        indices.push_back({ t, ratio, base });
+        return t;
+    }
+
     void set_input(const llama_ubatch * ubatch) override {
+        const llama_pos last_pos = (ubatch && ubatch->pos && ubatch->n_tokens > 0)
+            ? ubatch->pos[ubatch->n_tokens - 1] : 0;
+        for (const auto & ie : indices) {
+            if (ie.tensor == nullptr || ie.tensor->buffer == nullptr) {
+                continue;
+            }
+            const int32_t v = (int32_t)(ie.base + (ie.ratio > 0 ? (last_pos % ie.ratio) : 0));
+            ggml_backend_tensor_set(ie.tensor, &v, 0, sizeof(int32_t));
+        }
         for (const auto & mask : masks) {
             GGML_ASSERT(mask.tensor != nullptr);
             if (mask.tensor->buffer == nullptr) {
@@ -250,6 +289,37 @@ public:
 
             ggml_backend_tensor_set(mask.tensor, data.data(), 0, data.size()*sizeof(float));
         }
+    }
+
+    // Graph reuse: the mask tensors have FIXED shapes baked at build time and
+    // set_input() only refills their DATA. So the graph can be reused as long as
+    // every mask would be built with the exact same shape for the new ubatch.
+    // The only per-token variable is n_comp_visible = (last_pos+1)/ratio, which
+    // changes only at compression boundaries (every `ratio` tokens). When it is
+    // unchanged, the recurrent DSA state head is also unchanged (they advance
+    // together), so the whole decode graph is identical and CUDA graphs replay.
+    // When a boundary is crossed, return false -> the graph is rebuilt (rare).
+    bool can_reuse(const llm_graph_params & params) override {
+        const auto & ub = params.ubatch;
+        const int64_t nt = ub.n_tokens;
+        const llama_pos last_pos = ub.pos ? ub.pos[nt - 1] : (llama_pos)(nt - 1);
+        for (const auto & m : masks) {
+            if (m.tensor == nullptr || m.tensor->ne[1] != nt) {
+                return false;
+            }
+            const int64_t ncv = m.ratio > 0 ? (last_pos + 1) / m.ratio : 0;
+            int64_t want_n0;
+            switch (m.kind) {
+                case dsv4_mask_kind::RAW_WINDOW:      want_n0 = nt;       break;
+                case dsv4_mask_kind::COMPRESS_CAUSAL: want_n0 = ncv;      break;
+                case dsv4_mask_kind::ATTN_STATIC:     want_n0 = nt + ncv; break;
+                default:                              return false;
+            }
+            if (m.tensor->ne[0] != want_n0) {
+                return false;
+            }
+        }
+        return true;
     }
 
 private:
@@ -301,6 +371,7 @@ private:
     }
 
     std::vector<dsv4_mask_entry> masks;
+    std::vector<dsv4_index_entry> indices;
 };
 
 struct dsv4_rope_cfg {
@@ -816,7 +887,8 @@ static dsv4_decode_compressor dsv4_build_compressor_decode_projected(
         int64_t              compress_ratio,
         int                  rope_type,
         const dsv4_rope_cfg & rope_cfg,
-        float                norm_eps);
+        float                norm_eps,
+        ggml_tensor        * row_idx);
 
 static dsv4_decode_compressor dsv4_build_compressor_decode(
         ggml_context       * ctx,
@@ -833,21 +905,28 @@ static dsv4_decode_compressor dsv4_build_compressor_decode(
         int64_t              compress_ratio,
         int                  rope_type,
         const dsv4_rope_cfg & rope_cfg,
-        float                norm_eps) {
+        float                norm_eps,
+        ggml_tensor        * ape_idx = nullptr,
+        ggml_tensor        * row_idx = nullptr) {
     const dsv4_state_layout layout = dsv4_make_state_layout(compress_ratio, head_dim);
     const int64_t pos_mod = pos % compress_ratio;
 
     ggml_tensor * kv_cur = ggml_mul_mat(ctx, wkv, x);       // [width, 1]
     ggml_tensor * sc_cur = ggml_mul_mat(ctx, wgate, x);
     ggml_tensor * ape_f  = ape->type == GGML_TYPE_F32 ? ape : ggml_cast(ctx, ape, GGML_TYPE_F32);
-    sc_cur = ggml_add(ctx, sc_cur, ggml_view_2d(ctx, ape_f, layout.width, 1, ape_f->nb[1], pos_mod*ape_f->nb[1]));
+    // APE row select: use a refreshed index input (get_rows) so the graph can be
+    // reused across tokens; fall back to the baked view offset when no index.
+    ggml_tensor * ape_row = ape_idx
+        ? ggml_get_rows(ctx, ape_f, ape_idx)
+        : ggml_view_2d(ctx, ape_f, layout.width, 1, ape_f->nb[1], pos_mod*ape_f->nb[1]);
+    sc_cur = ggml_add(ctx, sc_cur, ape_row);
 
     return dsv4_build_compressor_decode_projected(ctx,
             kv_cur, sc_cur,
             prev_kv_state, prev_score_state,
             norm,
             head_dim, n_rot, pos, compress_ratio,
-            rope_type, rope_cfg, norm_eps);
+            rope_type, rope_cfg, norm_eps, row_idx);
 }
 
 static dsv4_decode_compressor dsv4_build_compressor_decode_projected(
@@ -863,23 +942,28 @@ static dsv4_decode_compressor dsv4_build_compressor_decode_projected(
         int64_t              compress_ratio,
         int                  rope_type,
         const dsv4_rope_cfg & rope_cfg,
-        float                norm_eps) {
+        float                norm_eps,
+        ggml_tensor        * row_idx) {
     const dsv4_state_layout layout = dsv4_make_state_layout(compress_ratio, head_dim);
     const int64_t pos_mod = pos % compress_ratio;
     const int64_t row = compress_ratio == 4 ? compress_ratio + pos_mod : pos_mod;
     const bool should_compress = (pos + 1) % compress_ratio == 0;
 
-    // Single-row write via cpy-into-view. ggml_set_rows would crash on
-    // multi-GPU (sched routes by src device while dst is on a different
-    // device; see dsv4_store_cache_rows for the same problem and fix).
+    // Single-row write into the recurrent state ring buffer.
     //
-    // We need to return a FULL-shape view of dst (downstream code at
-    // dsv4_view_cols slices the full state by columns/rows) AND establish
-    // a data dependency on the cpy. We mimic ggml_set_rows's internal
-    // construction: create a view_tensor of dst (which inherits dst's full
-    // shape), then manually set src[0] to the cpy result so sched orders
-    // the cpy before any consumer reading from this view.
+    // When row_idx (a refreshed per-token index input) is supplied, use
+    // ggml_set_rows so the write slot is data-driven, NOT baked into the graph
+    // as a view offset -> the decode graph can be reused across tokens (CUDA
+    // graph replay). In layer-split the state and the source live on the same
+    // device, so the historical multi-GPU set_rows routing crash does not apply.
+    //
+    // Fallback (row_idx == nullptr, e.g. the multi-token chunk path which never
+    // reuses): the original cpy-into-baked-view. It returns a FULL-shape view of
+    // dst with a manual dependency on the cpy so consumers wait for the write.
     auto cpy_into_row = [&](ggml_tensor * dst, ggml_tensor * row_src) -> ggml_tensor * {
+        if (row_idx) {
+            return ggml_set_rows(ctx, dst, row_src, row_idx);
+        }
         ggml_tensor * row_view = ggml_view_2d(ctx, dst,
                 dst->ne[0], 1,
                 dst->nb[1],
@@ -970,7 +1054,8 @@ static dsv4_decode_compressor dsv4_build_compressor_decode_chunk(
                 compress_ratio,
                 rope_type,
                 rope_cfg,
-                norm_eps);
+                norm_eps,
+                /*row_idx=*/nullptr);
 
         kv_state    = dec.kv_state;
         score_state = dec.score_state;
@@ -1329,6 +1414,10 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 const int64_t n_comp_cache = mctx_dsv4->get_dsv4_n_comp(il);
                 GGML_ASSERT(n_comp_visible <= n_comp_cache);
 
+                ggml_tensor * attn_ape_idx = n_tokens == 1
+                    ? get_dsv4_inputs()->add_index(ctx0, compress_ratio, 0, "dsv4_attn_ape_idx") : nullptr;
+                ggml_tensor * attn_row_idx = n_tokens == 1
+                    ? get_dsv4_inputs()->add_index(ctx0, compress_ratio, compress_ratio == 4 ? compress_ratio : 0, "dsv4_attn_row_idx") : nullptr;
                 dsv4_decode_compressor dec = n_tokens == 1
                     ? dsv4_build_compressor_decode(ctx0, cur,
                             prev_attn_kv_state,
@@ -1343,7 +1432,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             compress_ratio,
                             rope_type,
                             rope_cfg,
-                            norm_rms_eps)
+                            norm_rms_eps,
+                            attn_ape_idx,
+                            attn_row_idx)
                     : dsv4_build_compressor_decode_chunk(ctx0, cur,
                             prev_attn_kv_state,
                             prev_attn_sc_state,
@@ -1376,19 +1467,16 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
                 if (n_comp_visible > 0) {
                     ggml_tensor * kv_comp_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), n_comp_visible);
-                    // V4's KV cache is F16 (forced via llama-model.cpp); CUDA's
-                    // ggml_concat asserts F32 (ggml-cuda/concat.cu) — every other
-                    // architecture's concat takes F32 inputs from mul_mat/norm/rope,
-                    // so the assertion is correct. Cast both F16 inputs to F32 for
-                    // the concat, then cast the result back to F16 to preserve the
-                    // f16-KV-pin invariant for downstream attention. Metal's concat
-                    // is type-agnostic; on Metal these casts are accepted but the
-                    // intermediate F32 round-trip is wasted work. CPU concat handles
-                    // both types so it's also a no-op cost there.
-                    ggml_tensor * k_raw_f32   = ggml_cast(ctx0, k_raw,   GGML_TYPE_F32);
-                    ggml_tensor * comp_f32    = ggml_cast(ctx0, kv_comp_cache, GGML_TYPE_F32);
-                    ggml_tensor * concat_f32  = ggml_concat(ctx0, k_raw_f32, comp_f32, 2);
-                    k_all = ggml_cast(ctx0, concat_f32, GGML_TYPE_F16);
+                    // V4's KV cache is F16 (forced via llama-model.cpp). CUDA's
+                    // ggml_concat now supports F16 directly (ggml-cuda/concat.cu),
+                    // so concat the two F16 KV segments without the F16->F32->F16
+                    // round-trip. For finite/non-NaN cache values (all healthy model
+                    // activations) the old round-trip was numerically a no-op
+                    // (F16->F32 is exact, F32->F16 recovers the same bits), so this
+                    // is bit-identical; it only differs on NaN payload canonicalization,
+                    // which never occurs in valid inference. Drops 3 cast kernels per
+                    // layer/token and halves the concat's memory traffic.
+                    k_all = ggml_concat(ctx0, k_raw, kv_comp_cache, 2);
                     v_all = k_all;
 
                     ggml_tensor * comp_mask = nullptr;
@@ -1399,6 +1487,10 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                         ggml_tensor * prev_index_sc_state = dsv4_view_state_segment(ctx0, prev_sc_state_all,
                                 attn_state_layout.elems, index_state_layout.width, index_state_layout.rows);
 
+                        ggml_tensor * idx_ape_idx = n_tokens == 1
+                            ? get_dsv4_inputs()->add_index(ctx0, compress_ratio, 0, "dsv4_idx_ape_idx") : nullptr;
+                        ggml_tensor * idx_row_idx = n_tokens == 1
+                            ? get_dsv4_inputs()->add_index(ctx0, compress_ratio, compress_ratio == 4 ? compress_ratio : 0, "dsv4_idx_row_idx") : nullptr;
                         dsv4_decode_compressor index_dec = n_tokens == 1
                             ? dsv4_build_compressor_decode(ctx0, cur,
                                     prev_index_kv_state,
@@ -1413,7 +1505,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                     compress_ratio,
                                     rope_type,
                                     rope_cfg,
-                                    norm_rms_eps)
+                                    norm_rms_eps,
+                                    idx_ape_idx,
+                                    idx_row_idx)
                             : dsv4_build_compressor_decode_chunk(ctx0, cur,
                                     prev_index_kv_state,
                                     prev_index_sc_state,

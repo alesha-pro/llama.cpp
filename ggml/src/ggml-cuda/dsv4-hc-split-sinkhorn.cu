@@ -69,34 +69,72 @@ static __global__ void dsv4_hc_split_sinkhorn_f32(
     }
     __syncthreads();
 
-    // Sinkhorn iterations run on thread 0; n_hc <= 16 keeps the inner loops
-    // trivially cheap (~ 1k FLOPs per row total).
-    if (tid == 0) {
-        // First pass: per-dst_hc softmax (max-subtract for numerical stability,
-        // exp, normalize) + eps stabilizer.
+    // Sinkhorn iterations parallelized across the first n_hc threads of the
+    // block: thread `lane` owns matrix row `lane` during row-normalize/softmax
+    // phases and column `lane` during column-normalize phases. Each per-row and
+    // per-column reduction visits elements in the SAME order as the original
+    // tid==0 serial code, so float results are bit-identical; we only drop the
+    // serial dependency across the n_hc independent rows/cols and spread the
+    // expf() work over n_hc threads. The row/col phases write disjoint elements
+    // and a __syncthreads() between them publishes cross-row writes. Barriers
+    // sit OUTSIDE the (lane < n_hc) guard so every thread in the block reaches
+    // them (sinkhorn_iters is uniform across the block).
+    const int lane = tid;
+
+    // First pass: per-dst_hc softmax (max-subtract, exp, normalize) + eps.
+    if (lane < n_hc) {
+        const int dst_hc = lane;
+        float row_max = -INFINITY;
+        for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
+            row_max = fmaxf(row_max, c[src_hc + dst_hc * n_hc]);
+        }
+        float row_sum = 0.0f;
+        for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
+            const int idx = src_hc + dst_hc * n_hc;
+            const float v = expf(c[idx] - row_max);
+            c[idx] = v;
+            row_sum += v;
+        }
+        const float inv_sum = 1.0f / row_sum;
+        for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
+            const int idx = src_hc + dst_hc * n_hc;
+            c[idx] = c[idx] * inv_sum + eps;
+        }
+    }
+    __syncthreads();
+
+    // First column-normalize: per src_hc, divide by (column sum + eps).
+    if (lane < n_hc) {
+        const int src_hc = lane;
+        float sum = 0.0f;
         for (int dst_hc = 0; dst_hc < n_hc; ++dst_hc) {
-            float row_max = -INFINITY;
-            for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
-                row_max = fmaxf(row_max, c[src_hc + dst_hc * n_hc]);
-            }
+            sum += c[src_hc + dst_hc * n_hc];
+        }
+        const float inv_denom = 1.0f / (sum + eps);
+        for (int dst_hc = 0; dst_hc < n_hc; ++dst_hc) {
+            c[src_hc + dst_hc * n_hc] *= inv_denom;
+        }
+    }
+    __syncthreads();
 
-            float row_sum = 0.0f;
+    // Remaining sinkhorn_iters - 1 alternations: row-normalize then column-normalize.
+    for (int it = 1; it < sinkhorn_iters; ++it) {
+        // Row-normalize: per dst_hc, divide by (row sum + eps).
+        if (lane < n_hc) {
+            const int dst_hc = lane;
+            float sum = 0.0f;
             for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
-                const int idx = src_hc + dst_hc * n_hc;
-                const float v = expf(c[idx] - row_max);
-                c[idx] = v;
-                row_sum += v;
+                sum += c[src_hc + dst_hc * n_hc];
             }
-
-            const float inv_sum = 1.0f / row_sum;
+            const float inv_denom = 1.0f / (sum + eps);
             for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
-                const int idx = src_hc + dst_hc * n_hc;
-                c[idx] = c[idx] * inv_sum + eps;
+                c[src_hc + dst_hc * n_hc] *= inv_denom;
             }
         }
-
-        // First column-normalize: per src_hc, divide by (column sum + eps).
-        for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
+        __syncthreads();
+        // Column-normalize: per src_hc, divide by (column sum + eps).
+        if (lane < n_hc) {
+            const int src_hc = lane;
             float sum = 0.0f;
             for (int dst_hc = 0; dst_hc < n_hc; ++dst_hc) {
                 sum += c[src_hc + dst_hc * n_hc];
@@ -106,34 +144,8 @@ static __global__ void dsv4_hc_split_sinkhorn_f32(
                 c[src_hc + dst_hc * n_hc] *= inv_denom;
             }
         }
-
-        // Remaining sinkhorn_iters - 1 alternations: row-normalize then column-normalize.
-        for (int it = 1; it < sinkhorn_iters; ++it) {
-            // Row-normalize: per dst_hc, divide by (row sum + eps).
-            for (int dst_hc = 0; dst_hc < n_hc; ++dst_hc) {
-                float sum = 0.0f;
-                for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
-                    sum += c[src_hc + dst_hc * n_hc];
-                }
-                const float inv_denom = 1.0f / (sum + eps);
-                for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
-                    c[src_hc + dst_hc * n_hc] *= inv_denom;
-                }
-            }
-            // Column-normalize: per src_hc, divide by (column sum + eps).
-            for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
-                float sum = 0.0f;
-                for (int dst_hc = 0; dst_hc < n_hc; ++dst_hc) {
-                    sum += c[src_hc + dst_hc * n_hc];
-                }
-                const float inv_denom = 1.0f / (sum + eps);
-                for (int dst_hc = 0; dst_hc < n_hc; ++dst_hc) {
-                    c[src_hc + dst_hc * n_hc] *= inv_denom;
-                }
-            }
-        }
+        __syncthreads();
     }
-    __syncthreads();
 
     // Copy the comb matrix back to dst (parallel over the block).
     for (int i = tid; i < n_hc * n_hc; i += blksz) {

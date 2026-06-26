@@ -5404,8 +5404,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return op->type == GGML_TYPE_F32 && (op->src[0]->ne[2]*op->src[0]->ne[3]) <= (1 << 15);
         case GGML_OP_CONCAT:
             {
-                ggml_type src0_type = op->src[0]->type;
-                return src0_type != GGML_TYPE_I32 && src0_type != GGML_TYPE_I16;
+                // The runtime kernel (ggml-cuda/concat.cu) supports only same-type
+                // F32/F16. Mirror that contract so the scheduler routes other types
+                // (BF16, quantized, integer, ...) to a backend that handles them
+                // instead of aborting inside the kernel's type assert.
+                return op->src[0]->type == op->src[1]->type &&
+                       op->type == op->src[0]->type &&
+                       (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
             } break;
         case GGML_OP_CONV_TRANSPOSE_1D:
             {

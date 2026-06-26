@@ -1,5 +1,8 @@
 #include "llama-graph.h"
 
+#include <typeinfo>
+#include <cstdio>
+static FILE * rudbg_fp() { static FILE * fp = getenv("RUDBG") ? fopen("/tmp/rudbg_marker.log", "a") : nullptr; return fp; }
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -53,6 +56,15 @@ static bool can_reuse_kq_mask(
     res &= (kq_mask->ne[2] == 1);
     res &= (kq_mask->ne[3] == n_stream);
 
+    if (FILE * fp = rudbg_fp()) {
+        static long n = 0;
+        if (++n <= 16) {
+            fprintf(fp, "  kqmask: ne0=%lld n_kv=%u ne1=%lld ntok/str=%lld ne3=%lld nstream=%lld -> %d\n",
+                    (long long)kq_mask->ne[0], n_kv, (long long)kq_mask->ne[1], (long long)(n_tokens/n_stream),
+                    (long long)kq_mask->ne[3], (long long)n_stream, (int)res);
+            fflush(fp);
+        }
+    }
     return res;
 }
 
@@ -336,6 +348,15 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
 
+    if (FILE * fp = rudbg_fp()) {
+        static long n = 0;
+        if (++n <= 12) {
+            fprintf(fp, "  RS: s_copy.ne0=%lld n_rs=%u main=%lld nseqs=%u extra=%lld head=%u get_head=%u rs_z=%u get_rs_z=%u -> %d\n",
+                    (long long)s_copy->ne[0], mctx->get_n_rs(), (long long)s_copy_main->ne[0], (unsigned)params.ubatch.n_seqs,
+                    (long long)s_copy_extra->ne[0], (unsigned)head, (unsigned)mctx->get_head(), (unsigned)rs_z, (unsigned)mctx->get_rs_z(), (int)res);
+            fflush(fp);
+        }
+    }
     return res;
 }
 
@@ -931,6 +952,20 @@ void llm_graph_result::set_outputs() {
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
+    if (FILE * fp = rudbg_fp()) {
+        static long n = 0;
+        if (++n <= 14) {
+            const auto & a = this->params; const auto & b = params;
+            fprintf(fp, "enter#%ld allow=%d | ntok %d/%d nseq %d/%d nsequnq %d/%d eqseq %d/%d nout %u/%u nsamp %zu/%zu arch %d/%d gtype %d/%d emb %d/%d caus %d/%d\n",
+                n, (int)this->params.allow_reuse(params),
+                a.ubatch.n_tokens, b.ubatch.n_tokens, a.ubatch.n_seqs, b.ubatch.n_seqs,
+                a.ubatch.n_seqs_unq, b.ubatch.n_seqs_unq, (int)a.ubatch.equal_seqs(), (int)b.ubatch.equal_seqs(),
+                a.n_outputs, b.n_outputs, a.samplers.size(), b.samplers.size(),
+                (int)a.arch, (int)b.arch, (int)a.gtype, (int)b.gtype,
+                (int)a.cparams.embeddings, (int)b.cparams.embeddings, (int)a.cparams.causal_attn, (int)b.cparams.causal_attn);
+            fflush(fp);
+        }
+    }
     if (!this->params.allow_reuse(params)) {
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
@@ -945,14 +980,24 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 
     bool res = true;
 
+    int idx = 0;
     for (auto & input : inputs) {
         const bool cur = input->can_reuse(params);
 
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
         }
-
+        if (FILE * fp = rudbg_fp()) {
+            static long m = 0;
+            if (m < 200) { ++m; fprintf(fp, "  input idx %d type %s -> %d\n", idx, typeid(*input).name(), (int)cur); fflush(fp); }
+        }
+        ++idx;
         res = res && cur;
+    }
+    if (FILE * fp = rudbg_fp()) {
+        static long ncall = 0, nok = 0;
+        ++ncall; if (res) ++nok;
+        if (ncall <= 14) { fprintf(fp, "RESULT call %ld reuse=%d (ok %ld) ninputs=%d\n", ncall, (int)res, nok, (int)inputs.size()); fflush(fp); }
     }
 
     if (debug > 0) {
