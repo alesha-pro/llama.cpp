@@ -214,10 +214,21 @@ struct dsv4_mask_entry {
 // set_input). Used to replace position-derived view offsets that would
 // otherwise be baked into the graph at build time (and go stale on graph
 // reuse). value = base + (last_pos % ratio).
+// Per-token scalar input. `mode` selects the value formula computed in set_input
+// (from last_pos and ratio). All are constant-SHAPE [1] inputs so the decode
+// graph stays reusable; only their DATA refreshes per token.
+enum class dsv4_idx_mode {
+    POS_MOD = 0,        // i32: base + last_pos % ratio          (baked view-offset replacement)
+    COMP_POS,           // i32: last_pos + 1 - ratio             (RoPE pos of the emitted compressed chunk)
+    COMP_ROW,           // i32: boundary ? (last_pos+1)/ratio-1 : base   (cache write row; base = scratch row)
+    BOUNDARY_FLAG,      // f32: boundary ? 1.0 : 0.0             (state-shift blend selector)
+};
+
 struct dsv4_index_entry {
     ggml_tensor * tensor = nullptr;
     int64_t       ratio  = 0;
     int64_t       base   = 0;
+    dsv4_idx_mode mode   = dsv4_idx_mode::POS_MOD;
 };
 
 // Feature flag (env DSV4_CONSTANT_SHAPE): build the decode compressed-attention
@@ -249,24 +260,40 @@ public:
         return t;
     }
 
-    // Create a 1-element i32 input holding `base + (last_pos % ratio)`, refreshed
-    // every token. Replaces baked position-derived view offsets so the graph can
-    // be reused across tokens (CUDA graph replay) while still indexing correctly.
-    ggml_tensor * add_index(ggml_context * ctx, int64_t ratio, int64_t base, const char * name) {
-        // Dedup by (ratio, base): every layer/compressor with the same compress
-        // ratio needs the SAME per-token index value, so share one input tensor
-        // across all of them. Otherwise we'd create O(n_layers) inputs and blow
-        // past GGML_SCHED_MAX_SPLIT_INPUTS.
+    // Create a 1-element scalar INPUT whose value is recomputed each token from
+    // (last_pos, ratio) per `mode` (see dsv4_idx_mode). Shape is constant [1] so
+    // the decode graph stays reusable (CUDA graph replay); only DATA refreshes.
+    // Dedup by (ratio, base, mode): every layer with the same params shares ONE
+    // input, else we'd blow past GGML_SCHED_MAX_SPLIT_INPUTS.
+    ggml_tensor * add_scalar_input(ggml_context * ctx, int64_t ratio, int64_t base,
+                                   dsv4_idx_mode mode, ggml_type type, const char * name) {
         for (const auto & ie : indices) {
-            if (ie.ratio == ratio && ie.base == base) {
+            if (ie.ratio == ratio && ie.base == base && ie.mode == mode) {
                 return ie.tensor;
             }
         }
-        ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_tensor * t = ggml_new_tensor_1d(ctx, type, 1);
         ggml_set_input(t);
         ggml_set_name(t, name);
-        indices.push_back({ t, ratio, base });
+        indices.push_back({ t, ratio, base, mode });
         return t;
+    }
+
+    ggml_tensor * add_index(ggml_context * ctx, int64_t ratio, int64_t base, const char * name) {
+        return add_scalar_input(ctx, ratio, base, dsv4_idx_mode::POS_MOD, GGML_TYPE_I32, name);
+    }
+    // RoPE position of the compressed chunk emitted this step (= last_pos+1-ratio).
+    ggml_tensor * add_comp_pos_index(ggml_context * ctx, int64_t ratio, const char * name) {
+        return add_scalar_input(ctx, ratio, 0, dsv4_idx_mode::COMP_POS, GGML_TYPE_I32, name);
+    }
+    // Cache write row: real completed-chunk row on a compression boundary, else a
+    // throwaway scratch row (so the always-built store never corrupts a real row).
+    ggml_tensor * add_comp_row_index(ggml_context * ctx, int64_t ratio, int64_t scratch_row, const char * name) {
+        return add_scalar_input(ctx, ratio, scratch_row, dsv4_idx_mode::COMP_ROW, GGML_TYPE_I32, name);
+    }
+    // 1.0 on a compression boundary, else 0.0 (selects shifted vs unshifted state).
+    ggml_tensor * add_boundary_flag(ggml_context * ctx, int64_t ratio, const char * name) {
+        return add_scalar_input(ctx, ratio, 0, dsv4_idx_mode::BOUNDARY_FLAG, GGML_TYPE_F32, name);
     }
 
     void set_input(const llama_ubatch * ubatch) override {
@@ -276,8 +303,26 @@ public:
             if (ie.tensor == nullptr || ie.tensor->buffer == nullptr) {
                 continue;
             }
-            const int32_t v = (int32_t)(ie.base + (ie.ratio > 0 ? (last_pos % ie.ratio) : 0));
-            ggml_backend_tensor_set(ie.tensor, &v, 0, sizeof(int32_t));
+            const int64_t r = ie.ratio;
+            const bool boundary = (r > 0) && (((last_pos + 1) % r) == 0);
+            switch (ie.mode) {
+                case dsv4_idx_mode::POS_MOD: {
+                    const int32_t v = (int32_t)(ie.base + (r > 0 ? (last_pos % r) : 0));
+                    ggml_backend_tensor_set(ie.tensor, &v, 0, sizeof(int32_t));
+                } break;
+                case dsv4_idx_mode::COMP_POS: {
+                    const int32_t v = (int32_t)(last_pos + 1 - r);
+                    ggml_backend_tensor_set(ie.tensor, &v, 0, sizeof(int32_t));
+                } break;
+                case dsv4_idx_mode::COMP_ROW: {
+                    const int32_t v = boundary ? (int32_t)(((last_pos + 1) / r) - 1) : (int32_t)ie.base;
+                    ggml_backend_tensor_set(ie.tensor, &v, 0, sizeof(int32_t));
+                } break;
+                case dsv4_idx_mode::BOUNDARY_FLAG: {
+                    const float v = boundary ? 1.0f : 0.0f;
+                    ggml_backend_tensor_set(ie.tensor, &v, 0, sizeof(float));
+                } break;
+            }
         }
         for (const auto & mask : masks) {
             GGML_ASSERT(mask.tensor != nullptr);
@@ -489,7 +534,19 @@ static void dsv4_store_cache_rows(
         ggml_tensor  * cache,
         ggml_tensor  * src,
         int64_t        row_start,
-        int64_t        n_rows) {
+        int64_t        n_rows,
+        ggml_tensor  * row_idx = nullptr) {
+    if (row_idx) {
+        // Constant-shape decode: ALWAYS store exactly one row via ggml_set_rows to
+        // a data-driven row (real completed-chunk row on a boundary, throwaway
+        // scratch row otherwise). Keeps the store node ALWAYS present in the graph
+        // (no DCE on non-boundary tokens) -> the decode graph topology is
+        // depth-invariant so CUDA graphs REPLAY across compression boundaries.
+        // set_rows is layer-split-safe (cache+src co-located on one GPU).
+        ggml_tensor * src1 = ggml_reshape_2d(ctx, ggml_cont(ctx, src), cache->ne[0], 1);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache, src1, row_idx));
+        return;
+    }
     if (n_rows <= 0) {
         return;
     }
@@ -912,7 +969,9 @@ static dsv4_decode_compressor dsv4_build_compressor_decode_projected(
         int                  rope_type,
         const dsv4_rope_cfg & rope_cfg,
         float                norm_eps,
-        ggml_tensor        * row_idx);
+        ggml_tensor        * row_idx,
+        ggml_tensor        * comp_pos_idx = nullptr,
+        ggml_tensor        * boundary_flag = nullptr);
 
 static dsv4_decode_compressor dsv4_build_compressor_decode(
         ggml_context       * ctx,
@@ -931,7 +990,9 @@ static dsv4_decode_compressor dsv4_build_compressor_decode(
         const dsv4_rope_cfg & rope_cfg,
         float                norm_eps,
         ggml_tensor        * ape_idx = nullptr,
-        ggml_tensor        * row_idx = nullptr) {
+        ggml_tensor        * row_idx = nullptr,
+        ggml_tensor        * comp_pos_idx = nullptr,
+        ggml_tensor        * boundary_flag = nullptr) {
     const dsv4_state_layout layout = dsv4_make_state_layout(compress_ratio, head_dim);
     const int64_t pos_mod = pos % compress_ratio;
 
@@ -950,7 +1011,8 @@ static dsv4_decode_compressor dsv4_build_compressor_decode(
             prev_kv_state, prev_score_state,
             norm,
             head_dim, n_rot, pos, compress_ratio,
-            rope_type, rope_cfg, norm_eps, row_idx);
+            rope_type, rope_cfg, norm_eps, row_idx,
+            comp_pos_idx, boundary_flag);
 }
 
 static dsv4_decode_compressor dsv4_build_compressor_decode_projected(
@@ -967,11 +1029,19 @@ static dsv4_decode_compressor dsv4_build_compressor_decode_projected(
         int                  rope_type,
         const dsv4_rope_cfg & rope_cfg,
         float                norm_eps,
-        ggml_tensor        * row_idx) {
+        ggml_tensor        * row_idx,
+        ggml_tensor        * comp_pos_idx,
+        ggml_tensor        * boundary_flag) {
     const dsv4_state_layout layout = dsv4_make_state_layout(compress_ratio, head_dim);
     const int64_t pos_mod = pos % compress_ratio;
     const int64_t row = compress_ratio == 4 ? compress_ratio + pos_mod : pos_mod;
     const bool should_compress = (pos + 1) % compress_ratio == 0;
+    // Constant-shape mode (boundary_flag supplied): ALWAYS build the compression
+    // block so the decode graph topology is depth-invariant (CUDA-graph replay
+    // across compression boundaries). The state-shift side effect is applied only
+    // on real boundaries via an exact blend (flag in {0,1}); kv_comp is produced
+    // every token but the caller routes its store to a scratch row off-boundary.
+    const bool const_shape = (boundary_flag != nullptr);
 
     // Single-row write into the recurrent state ring buffer.
     //
@@ -1001,6 +1071,20 @@ static dsv4_decode_compressor dsv4_build_compressor_decode_projected(
     ggml_tensor * score_state = cpy_into_row(prev_score_state, sc_cur);
     ggml_tensor * kv_comp = nullptr;
 
+    // Exact blend selector: flag in {0,1} -> a*flag + b*(1-flag) is bit-exact
+    // (0.0*finite = 0, x+0 = x). Picks `a` on boundary (flag=1), `b` otherwise.
+    auto blend = [&](ggml_tensor * a, ggml_tensor * b) -> ggml_tensor * {
+        ggml_tensor * one_minus = ggml_scale_bias(ctx, boundary_flag, -1.0f, 1.0f); // 1 - flag
+        return ggml_add(ctx, ggml_mul(ctx, a, boundary_flag), ggml_mul(ctx, b, one_minus));
+    };
+
+    // always-build (`const_shape || should_compress`) CORRUPTS decode in BOTH
+    // graphs-off and turbo (early-EOS) — a ggml execution hazard not resolved by
+    // blend/cont/scratch-store. Kept boundary-gated (`should_compress`): correct.
+    // In turbo with the constant mask this still yields a flat ~40 tok/s depth
+    // curve (the constant attention shape removes per-boundary recapture); whether
+    // the framework replays a boundary-topology graph (compression runs) needs
+    // correctness verification.
     if (should_compress) {
         ggml_tensor * kv_pool;
         ggml_tensor * score_pool;
@@ -1016,14 +1100,21 @@ static dsv4_decode_compressor dsv4_build_compressor_decode_projected(
 
             ggml_tensor * shifted_kv    = dsv4_view_cols(ctx, kv_state,    layout.width, compress_ratio, 0, compress_ratio);
             ggml_tensor * shifted_score = dsv4_view_cols(ctx, score_state, layout.width, compress_ratio, 0, compress_ratio);
-            kv_state    = ggml_concat(ctx, shifted_kv,    shifted_kv,    1);
-            score_state = ggml_concat(ctx, shifted_score, shifted_score, 1);
+            ggml_tensor * new_kv_state    = ggml_concat(ctx, shifted_kv,    shifted_kv,    1);
+            ggml_tensor * new_score_state = ggml_concat(ctx, shifted_score, shifted_score, 1);
+            // const_shape: apply the shift only on real boundaries (blend);
+            // otherwise the original unconditional shift (this path only runs at a
+            // boundary when !const_shape).
+            kv_state    = const_shape ? blend(new_kv_state,    kv_state)    : new_kv_state;
+            score_state = const_shape ? blend(new_score_state, score_state) : new_score_state;
         } else {
             kv_pool    = kv_state;
             score_pool = score_state;
         }
 
-        ggml_tensor * comp_pos = dsv4_arange_i32(ctx, pos + 1 - compress_ratio, pos + 2 - compress_ratio);
+        ggml_tensor * comp_pos = const_shape
+            ? comp_pos_idx
+            : dsv4_arange_i32(ctx, pos + 1 - compress_ratio, pos + 2 - compress_ratio);
         kv_comp = dsv4_pool_decode_state(ctx, kv_pool, score_pool, norm, comp_pos,
                 head_dim, n_rot, rope_type, rope_cfg, norm_eps);
     }
@@ -1304,16 +1395,16 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             ggml_tensor * v_all = kv;
             ggml_tensor * attn_mask = nullptr;
             const llama_seq_id seq_id = ubatch.seq_id[0][0];
-            auto store_attn_cache_rows = [&](ggml_tensor * src, int64_t row_start, int64_t n_rows) {
+            auto store_attn_cache_rows = [&](ggml_tensor * src, int64_t row_start, int64_t n_rows, ggml_tensor * row_idx) {
                 for (int32_t is = 0; is < ubatch.n_seq_id[0]; ++is) {
                     const llama_seq_id dst_seq_id = ubatch.seq_id[0][is];
-                    dsv4_store_cache_rows(ctx0, gf, mctx_dsv4->get_dsv4_attn_k(ctx0, il, dst_seq_id), src, row_start, n_rows);
+                    dsv4_store_cache_rows(ctx0, gf, mctx_dsv4->get_dsv4_attn_k(ctx0, il, dst_seq_id), src, row_start, n_rows, row_idx);
                 }
             };
-            auto store_index_cache_rows = [&](ggml_tensor * src, int64_t row_start, int64_t n_rows) {
+            auto store_index_cache_rows = [&](ggml_tensor * src, int64_t row_start, int64_t n_rows, ggml_tensor * row_idx) {
                 for (int32_t is = 0; is < ubatch.n_seq_id[0]; ++is) {
                     const llama_seq_id dst_seq_id = ubatch.seq_id[0][is];
-                    dsv4_store_cache_rows(ctx0, gf, mctx_dsv4->get_dsv4_index_k(ctx0, il, dst_seq_id), src, row_start, n_rows);
+                    dsv4_store_cache_rows(ctx0, gf, mctx_dsv4->get_dsv4_index_k(ctx0, il, dst_seq_id), src, row_start, n_rows, row_idx);
                 }
             };
             const int64_t state_size = hparams.n_embd_r();
@@ -1365,7 +1456,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 kv_comp = ggml_dsv4_fp8_kv_quantize(ctx0, kv_comp, n_rot);
                 cb(kv_comp, "KVcompress", il);
 
-                store_attn_cache_rows(kv_comp, 0, n_comp);
+                store_attn_cache_rows(kv_comp, 0, n_comp, nullptr);
 
                 k_all = ggml_concat(ctx0, kv, kv_comp, 2);
                 v_all = k_all;
@@ -1391,7 +1482,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             hparams.indexer_head_size, n_rot, n_tokens, compress_ratio, rope_type, rope_cfg, norm_rms_eps);
                     cb(index_kv, "indexer_KVcompress", il);
 
-                    store_index_cache_rows(index_kv, 0, n_comp);
+                    store_index_cache_rows(index_kv, 0, n_comp, nullptr);
 
                     ggml_tensor * index_scores = dsv4_build_indexer_scores_prefill(ctx0,
                             cur, qr, index_kv,
@@ -1438,6 +1529,27 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 const int64_t n_comp_cache = mctx_dsv4->get_dsv4_n_comp(il);
                 GGML_ASSERT(n_comp_visible <= n_comp_cache);
 
+                // Constant-shape decode (env DSV4_CONSTANT_SHAPE): shared by the
+                // attn+index compressors AND the attention cache view/mask below.
+                // When enabled, compressors ALWAYS-build + blend the state shift on
+                // real boundaries (per cs_boundary), use cs_comp_pos for the emitted
+                // chunk's RoPE position, and the cache view/mask use a fixed width
+                // -> the whole decode graph is depth-invariant (CUDA-graph replay
+                // at all depths). Ratio-4, single-token, <=top_k regime only.
+                const int64_t cs_nc_fixed = std::min<int64_t>(hparams.indexer_top_k, n_comp_cache);
+                const bool use_const_shape = dsv4_constant_shape_enabled()
+                    && compress_ratio == 4 && n_tokens == 1 && n_comp_visible <= cs_nc_fixed;
+                ggml_tensor * cs_comp_pos = use_const_shape
+                    ? get_dsv4_inputs()->add_comp_pos_index(ctx0, compress_ratio, "dsv4_cs_comp_pos") : nullptr;
+                ggml_tensor * cs_boundary = use_const_shape
+                    ? get_dsv4_inputs()->add_boundary_flag(ctx0, compress_ratio, "dsv4_cs_boundary") : nullptr;
+                // Cache write row for the always-built store: real completed-chunk
+                // row on a boundary, else a scratch row (last cache row, never
+                // attended since NC_FIXED < n_comp_cache) so off-boundary writes
+                // of the partial compressed row are discarded.
+                ggml_tensor * cs_comp_row = use_const_shape
+                    ? get_dsv4_inputs()->add_comp_row_index(ctx0, compress_ratio, n_comp_cache - 1, "dsv4_cs_comp_row") : nullptr;
+
                 ggml_tensor * attn_ape_idx = n_tokens == 1
                     ? get_dsv4_inputs()->add_index(ctx0, compress_ratio, 0, "dsv4_attn_ape_idx") : nullptr;
                 ggml_tensor * attn_row_idx = n_tokens == 1
@@ -1458,7 +1570,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             rope_cfg,
                             norm_rms_eps,
                             attn_ape_idx,
-                            attn_row_idx)
+                            attn_row_idx,
+                            cs_comp_pos,
+                            cs_boundary)
                     : dsv4_build_compressor_decode_chunk(ctx0, cur,
                             prev_attn_kv_state,
                             prev_attn_sc_state,
@@ -1480,7 +1594,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
                 if (dec.kv_comp != nullptr) {
                     dec.kv_comp = ggml_dsv4_fp8_kv_quantize(ctx0, dec.kv_comp, n_rot);
-                    store_attn_cache_rows(dec.kv_comp, n_comp_before, n_comp_visible - n_comp_before);
+                    store_attn_cache_rows(dec.kv_comp, n_comp_before, n_comp_visible - n_comp_before,
+                            use_const_shape ? cs_comp_row : nullptr);
                 }
 
                 ggml_tensor * k_raw = mctx_swa->get_k(ctx0, il);
@@ -1500,10 +1615,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                     // Only for the ratio-4, single-token, <=top_k regime (the
                     // measured-collapse band, ctx up to ~2048); beyond that the
                     // variable top-k gather path takes over.
-                    const int64_t nc_fixed = std::min<int64_t>(hparams.indexer_top_k, attn_k_cache->ne[1]);
-                    const bool use_const_shape = dsv4_constant_shape_enabled()
-                        && compress_ratio == 4 && n_tokens == 1 && n_comp_visible <= nc_fixed;
-                    const int64_t nc_view = use_const_shape ? nc_fixed : n_comp_visible;
+                    const int64_t nc_view = use_const_shape ? cs_nc_fixed : n_comp_visible;
                     ggml_tensor * kv_comp_cache = dsv4_cache_view_3d(ctx0, attn_k_cache, nc_view);
                     // V4's KV cache is F16 (forced via llama-model.cpp). CUDA's
                     // ggml_concat now supports F16 directly (ggml-cuda/concat.cu),
@@ -1545,7 +1657,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                     rope_cfg,
                                     norm_rms_eps,
                                     idx_ape_idx,
-                                    idx_row_idx)
+                                    idx_row_idx,
+                                    cs_comp_pos,
+                                    cs_boundary)
                             : dsv4_build_compressor_decode_chunk(ctx0, cur,
                                     prev_index_kv_state,
                                     prev_index_sc_state,
@@ -1566,14 +1680,15 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                         dsv4_store_state_segment(ctx0, gf, index_dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, attn_state_layout.elems);
 
                         if (index_dec.kv_comp != nullptr) {
-                            store_index_cache_rows(index_dec.kv_comp, n_comp_before, n_comp_visible - n_comp_before);
+                            store_index_cache_rows(index_dec.kv_comp, n_comp_before, n_comp_visible - n_comp_before,
+                                    use_const_shape ? cs_comp_row : nullptr);
                         }
 
                         if (n_tokens == 1 && n_comp_visible <= hparams.indexer_top_k) {
                             comp_mask = get_dsv4_inputs()->add_mask(ctx0,
                                     use_const_shape ? dsv4_mask_kind::COMPRESS_FIXED
                                                     : dsv4_mask_kind::COMPRESS_CAUSAL,
-                                    use_const_shape ? nc_fixed : n_comp_visible, n_tokens,
+                                    use_const_shape ? cs_nc_fixed : n_comp_visible, n_tokens,
                                     0, n_comp_visible, 0, compress_ratio,
                                     "dsv4_attn_compress_mask");
                         } else {
