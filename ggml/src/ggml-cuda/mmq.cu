@@ -212,12 +212,17 @@ void ggml_cuda_mul_mat_q(
     const int64_t s13 = ne12*s12;
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
+    // ncols_max bounds the per-expert column tiles (ntx). With duplicate expert slots an expert can
+    // receive more than ne12 occurrences (measured up to 66 at ubatch 64), so the upstream value of
+    // ne12 would skip that expert's tail tiles -> silently wrong output. ne_get_rows is the safe upper
+    // bound on any single expert's columns; stream-k skips the (mostly empty) extra tiles cheaply via
+    // the jt*mmq_x>=col_diff check (the resulting overhead is within run-to-run noise).
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        use_stream_k, ne12};
+        use_stream_k, ne_get_rows};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
