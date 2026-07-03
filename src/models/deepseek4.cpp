@@ -199,6 +199,15 @@ enum class dsv4_mask_kind {
     // so the decode CUDA graph can REPLAY across compression boundaries instead
     // of recapturing every `ratio` tokens. Pairs with a fixed-width cache view.
     COMPRESS_FIXED,
+    // Like COMPRESS_FIXED but the width is BUCKETED instead of constant:
+    // ne[0] = min(GGML_PAD(n_comp_visible, bucket), cap), with the bucket size
+    // stored in `window` and the cap in `n_comp`. can_reuse recomputes the
+    // bucketed width from the new ubatch, so the shape (and the graph) changes
+    // only every bucket*ratio tokens instead of every ratio tokens. Used to
+    // mask the bucketed indexer-score view in the top-k GATHER decode path
+    // (rows beyond n_comp_visible are zero in the cache and would relu-score
+    // 0.0, potentially outranking real rows -> mask them to -INF before top-k).
+    COMPRESS_BUCKET,
 };
 
 struct dsv4_mask_entry {
@@ -240,6 +249,20 @@ static bool dsv4_constant_shape_enabled() {
     static const bool v = getenv("DSV4_CONSTANT_SHAPE") != nullptr;
     return v;
 }
+
+// Kill-switch for the top-k GATHER decode path (the beyond-top_k long-context
+// regime). With DSV4_CONSTANT_SHAPE set and this unset, decode past
+// n_comp_visible > top_k gathers the selected 512 compressed rows via
+// get_rows so the attention width stays [n_raw + top_k] at any depth.
+static bool dsv4_topk_gather_disabled() {
+    static const bool v = getenv("DSV4_NO_TOPK_GATHER") != nullptr;
+    return v;
+}
+
+// Indexer-score width bucket (rows) for the gather path: the score/argsort
+// shapes change only every DSV4_CS_BUCKET*ratio tokens (=8192 at ratio 4), so
+// the decode graph replays in between instead of recapturing every boundary.
+static constexpr int64_t DSV4_CS_BUCKET = 2048;
 
 class dsv4_graph_inputs : public llm_graph_input_i {
 public:
@@ -347,6 +370,11 @@ public:
                     // [0, NC_FIXED) stays -INF (the data() init). Same fill logic.
                     fill_compress_causal(data, n0, n1, mask.ratio, 0, ubatch);
                     break;
+                case dsv4_mask_kind::COMPRESS_BUCKET:
+                    // Bucketed width: causal 0 for [0, n_comp_visible), the rest
+                    // of the bucket stays -INF (the data() init). Same fill logic.
+                    fill_compress_causal(data, n0, n1, mask.ratio, 0, ubatch);
+                    break;
                 case dsv4_mask_kind::ATTN_STATIC:
                     fill_raw_window(data, n0, n1, mask.window, ubatch);
                     fill_compress_causal(data, n0, n1, mask.ratio, mask.n_raw, ubatch);
@@ -380,8 +408,19 @@ public:
                 case dsv4_mask_kind::COMPRESS_CAUSAL: want_n0 = ncv;      break;
                 case dsv4_mask_kind::ATTN_STATIC:     want_n0 = nt + ncv; break;
                 // Fixed-width mask: ne[0] is a depth-invariant constant, so it
-                // always matches itself -> never blocks reuse on depth.
-                case dsv4_mask_kind::COMPRESS_FIXED:  want_n0 = m.tensor->ne[0]; break;
+                // matches itself while n_comp_visible still fits the fixed width.
+                // Once ncv outgrows it the build would switch to the top-k path,
+                // so force a rebuild instead of silently reusing a stale view
+                // that misses the newest compressed rows.
+                case dsv4_mask_kind::COMPRESS_FIXED:
+                    want_n0 = ncv <= m.tensor->ne[0] ? m.tensor->ne[0] : -1;
+                    break;
+                // Bucketed mask (top-k gather): recompute the bucketed width for
+                // the new ubatch; reuse holds within a bucket, fails at bucket
+                // crossings (every bucket*ratio tokens) -> rare rebuilds.
+                case dsv4_mask_kind::COMPRESS_BUCKET:
+                    want_n0 = std::min<int64_t>(GGML_PAD(ncv, m.window), m.n_comp);
+                    break;
                 default:                              return false;
             }
             if (m.tensor->ne[0] != want_n0) {
@@ -1579,18 +1618,32 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 // Require cs_nc_fixed < n_comp_cache so the off-boundary scratch row
                 // (n_comp_cache-1) is OUTSIDE the attended fixed view [0, cs_nc_fixed)
                 // -> discarded partial writes are never read by attention.
-                const bool use_const_shape = dsv4_constant_shape_enabled()
-                    && compress_ratio == 4 && n_tokens == 1 && n_comp_visible <= cs_nc_fixed
+                const bool cs_infra_ok = dsv4_constant_shape_enabled()
+                    && compress_ratio == 4 && n_tokens == 1
                     && cs_nc_fixed < n_comp_cache;
-                ggml_tensor * cs_comp_pos = use_const_shape
+                // Fixed-mask regime: everything visible fits under top_k, attend
+                // the fixed [0, cs_nc_fixed) view with a COMPRESS_FIXED mask.
+                const bool use_const_shape = cs_infra_ok && n_comp_visible <= cs_nc_fixed;
+                // Beyond top_k the top-k branch selects 512 rows anyway: GATHER
+                // them (get_rows) instead of masking the full growing width, so
+                // the attention shape stays [n_raw + top_k] at ANY depth and the
+                // indexer score width is bucketed (shape changes only every
+                // DSV4_CS_BUCKET*ratio tokens) -> the decode graph replays at
+                // long context too instead of collapsing into recapture.
+                const bool use_topk_gather = cs_infra_ok && n_comp_visible > cs_nc_fixed
+                    && !dsv4_topk_gather_disabled();
+                // The always-build compressor machinery (blend + input-driven
+                // positions/rows) is required by BOTH constant-shape regimes.
+                const bool cs_compressor = use_const_shape || use_topk_gather;
+                ggml_tensor * cs_comp_pos = cs_compressor
                     ? get_dsv4_inputs()->add_comp_pos_index(ctx0, compress_ratio, "dsv4_cs_comp_pos") : nullptr;
-                ggml_tensor * cs_boundary = use_const_shape
+                ggml_tensor * cs_boundary = cs_compressor
                     ? get_dsv4_inputs()->add_boundary_flag(ctx0, compress_ratio, "dsv4_cs_boundary") : nullptr;
                 // Cache write row for the always-built store: real completed-chunk
                 // row on a boundary, else a scratch row (last cache row, never
                 // attended since NC_FIXED < n_comp_cache) so off-boundary writes
                 // of the partial compressed row are discarded.
-                ggml_tensor * cs_comp_row = use_const_shape
+                ggml_tensor * cs_comp_row = cs_compressor
                     ? get_dsv4_inputs()->add_comp_row_index(ctx0, compress_ratio, n_comp_cache - 1, "dsv4_cs_comp_row") : nullptr;
 
                 ggml_tensor * attn_ape_idx = n_tokens == 1
@@ -1639,7 +1692,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 if (dec.kv_comp != nullptr) {
                     dec.kv_comp = ggml_dsv4_fp8_kv_quantize(ctx0, dec.kv_comp, n_rot);
                     attn_k_cache_stored = store_attn_cache_rows(dec.kv_comp, n_comp_before, n_comp_visible - n_comp_before,
-                            use_const_shape ? cs_comp_row : nullptr);
+                            cs_compressor ? cs_comp_row : nullptr);
                 }
 
                 ggml_tensor * k_raw = mctx_swa->get_k(ctx0, il);
@@ -1730,7 +1783,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                         ggml_tensor * index_k_cache_stored = nullptr;
                         if (index_dec.kv_comp != nullptr) {
                             index_k_cache_stored = store_index_cache_rows(index_dec.kv_comp, n_comp_before, n_comp_visible - n_comp_before,
-                                    use_const_shape ? cs_comp_row : nullptr);
+                                    cs_compressor ? cs_comp_row : nullptr);
                         }
 
                         if (n_tokens == 1 && n_comp_visible <= hparams.indexer_top_k) {
@@ -1741,10 +1794,19 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                     0, n_comp_visible, 0, compress_ratio,
                                     "dsv4_attn_compress_mask");
                         } else {
+                            // Gather mode buckets the indexer width so its shape
+                            // changes only every DSV4_CS_BUCKET*ratio tokens; the
+                            // legacy masked path uses the exact visible width
+                            // (shape changes every ratio tokens -> recapture).
+                            // Cap at n_comp_cache-1 to keep the scratch row out
+                            // of both the score view and the gather.
+                            const int64_t nc_idx = use_topk_gather
+                                ? std::min<int64_t>(GGML_PAD(n_comp_visible, DSV4_CS_BUCKET), n_comp_cache - 1)
+                                : n_comp_visible;
                             ggml_tensor * index_cache = dsv4_cache_view_3d(ctx0,
                                     index_k_cache_stored ? index_k_cache_stored : mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id),
-                                    n_comp_visible);
-                            index_cache = ggml_reshape_2d(ctx0, index_cache, hparams.indexer_head_size, n_comp_visible);
+                                    nc_idx);
+                            index_cache = ggml_reshape_2d(ctx0, index_cache, hparams.indexer_head_size, nc_idx);
                             ggml_tensor * index_scores = n_tokens == 1
                                 ? dsv4_build_indexer_scores_decode(ctx0,
                                         cur, qr, index_cache,
@@ -1753,7 +1815,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                         inp_pos,
                                         hparams.indexer_n_head,
                                         hparams.indexer_head_size,
-                                        n_comp_visible,
+                                        nc_idx,
                                         n_rot,
                                         rope_type,
                                         rope_cfg)
@@ -1775,11 +1837,47 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                         rope_cfg);
                             cb(index_scores, "indexer_scores", il);
 
-                            const int top_k = std::min<int64_t>(hparams.indexer_top_k, n_comp_visible);
-                            ggml_tensor * topk = ggml_argsort_top_k(ctx0, index_scores, top_k);
-                            cb(topk, "indexer_topk", il);
+                            if (use_topk_gather) {
+                                // Rows [n_comp_visible, nc_idx) of the bucketed
+                                // view are zero (cache zero-init) and relu-score
+                                // exactly 0.0, which could outrank real rows ->
+                                // mask them to -INF before the top-k (bucketed
+                                // input mask, refreshed per token).
+                                ggml_tensor * idx_score_mask = get_dsv4_inputs()->add_mask(ctx0,
+                                        dsv4_mask_kind::COMPRESS_BUCKET,
+                                        nc_idx, n_tokens,
+                                        0, n_comp_cache - 1, DSV4_CS_BUCKET, compress_ratio,
+                                        "dsv4_idx_score_bucket_mask");
+                                index_scores = ggml_add(ctx0, index_scores, idx_score_mask);
 
-                            comp_mask = dsv4_build_compressed_mask_from_topk(ctx0, index_scores, topk);
+                                const int64_t top_k = hparams.indexer_top_k;
+                                ggml_tensor * topk = ggml_argsort_top_k(ctx0, index_scores, top_k);
+                                cb(topk, "indexer_topk", il);
+                                topk = ggml_reshape_1d(ctx0, topk, top_k);
+
+                                // GATHER the selected compressed-K rows: the
+                                // attention runs over a constant [n_raw + top_k]
+                                // width at ANY depth (same attended set as the
+                                // masked path; softmax is order-invariant).
+                                ggml_tensor * comp_rows = ggml_view_2d(ctx0, attn_k_cache,
+                                        attn_k_cache->ne[0], nc_idx, attn_k_cache->nb[1], 0);
+                                ggml_tensor * kv_sel = ggml_get_rows(ctx0, comp_rows, topk); // F32 [ne0, top_k]
+                                kv_sel = ggml_cast(ctx0, kv_sel, GGML_TYPE_F16);
+                                kv_sel = ggml_reshape_3d(ctx0, kv_sel, attn_k_cache->ne[0], 1, top_k);
+                                k_all = ggml_concat(ctx0, k_raw, kv_sel, 2);
+                                v_all = k_all;
+
+                                // Every gathered row is a valid top-k selection
+                                // (n_comp_visible > top_k in this branch) -> a
+                                // plain all-zero mask of constant shape.
+                                comp_mask = dsv4_new_filled_2d(ctx0, top_k, n_tokens, 0.0f);
+                            } else {
+                                const int top_k = std::min<int64_t>(hparams.indexer_top_k, n_comp_visible);
+                                ggml_tensor * topk = ggml_argsort_top_k(ctx0, index_scores, top_k);
+                                cb(topk, "indexer_topk", il);
+
+                                comp_mask = dsv4_build_compressed_mask_from_topk(ctx0, index_scores, topk);
+                            }
                         }
                     } else {
                         comp_mask = get_dsv4_inputs()->add_mask(ctx0,
