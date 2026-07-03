@@ -603,6 +603,30 @@ static ggml_tensor * dsv4_new_filled_3d(ggml_context * ctx, int64_t n0, int64_t 
     return ggml_fill(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n0, n1, n2), value);
 }
 
+// Pad the flash-attention K/V width to a multiple of FATTN_KQ_STRIDE (256).
+// The CUDA FA kernels for head size 512 REQUIRE K->ne[1] % 256 == 0
+// (gqa_opt_applies in fattn.cu), otherwise the op silently falls back to the
+// CPU backend: every ratio-4 prompt-chunk attention (width n_tokens +
+// n_comp_visible, arbitrary) ran on the CPU - D2H copies of K/V/mask, an
+// ~11 GB pinned host compute buffer re-allocated as the width grew
+// (cudaMallocHost calls of up to 10 s per chunk), GPUs ~95% idle at depth.
+// K/V rows are padded with ZEROS (ggml_pad), the F32 mask with -INF, so the
+// padded tail carries zero attention weight - bit-identical output.
+static void dsv4_pad_fattn_width(ggml_context * ctx, ggml_tensor ** k_all, ggml_tensor ** attn_mask) {
+    const int64_t w   = (*k_all)->ne[2];
+    const int64_t pad = ((w + 255) / 256) * 256 - w;
+    if (pad == 0) {
+        return;
+    }
+    // NB: CUDA ggml_pad asserts F32, so pad K via an F16 zero-fill + concat
+    // (fill.cu supports F16).
+    ggml_tensor * kz = ggml_fill(ctx,
+            ggml_new_tensor_3d(ctx, (*k_all)->type, (*k_all)->ne[0], 1, pad), 0.0f);
+    *k_all = ggml_concat(ctx, *k_all, kz, 2);
+    ggml_tensor * mz = dsv4_new_filled_2d(ctx, pad, (*attn_mask)->ne[1], -INFINITY);
+    *attn_mask = ggml_concat(ctx, *attn_mask, mz, 0);
+}
+
 // mask[i, q] = i < (pos_q + 1)/ratio ? 0 : -1e9   (compressed causal), on GPU.
 // i < (p+1)/r  <=>  (i+1)*r <= p+1  <=>  p + 1.5 - (i+1)*r > 0 for integers.
 static ggml_tensor * dsv4_gpu_mask_comp_causal(
@@ -2196,6 +2220,12 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 }
             }
 
+            if (cparams.flash_attn && k_all == v_all) {
+                // Keep the FA width a multiple of 256 so the CUDA kernel for
+                // head 512 accepts it (else silent CPU fallback, see helper).
+                dsv4_pad_fattn_width(ctx0, &k_all, &attn_mask);
+                v_all = k_all;
+            }
             ggml_tensor * attn_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, attn_mask, GGML_TYPE_F16) : attn_mask;
             cur = build_attn_mha(q, k_all, v_all, nullptr, attn_mask_cnv, layer.attn_sinks, nullptr, nullptr, kq_scale, il);
             cb(cur, "kqv_out", il);
