@@ -1529,6 +1529,22 @@ static ggml_tensor * dsv4_build_indexer_scores_prefill(
             rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
             rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, false);
 
+    if (getenv("DSV4_NO_LIGHTNING_IDX") == nullptr) {
+        // Fused NSA indexer scoring (the upstream lightning-indexer kernel,
+        // also used by DeepSeek V3.2). The decomposed path below materializes
+        // a [n_comp, n_tokens, n_heads] F32 intermediate - at 125K ctx that
+        // blob is ~4 GB per layer and OOMed the compute buffer (the 131K
+        // prefill died at depth ~73K). Math is identical: relu is positively
+        // homogeneous, so the decomposed path's combined
+        // 1/sqrt(head_size*n_heads) weight scale equals scale_embd*scale_heads.
+        ggml_tensor * w = ggml_mul_mat(ctx, wproj, x); // [n_heads, n_tokens]
+        ggml_tensor * score = ggml_lightning_indexer(ctx, q, index_kv, w,
+                1.0f / std::sqrt((float) n_index_head_size),
+                1.0f / std::sqrt((float) n_index_head));
+        score = ggml_reshape_2d(ctx, score, index_kv->ne[2], n_tokens);
+        return ggml_add(ctx, score, causal_mask);
+    }
+
     ggml_tensor * k = ggml_permute(ctx, index_kv, 0, 2, 1, 3); // [head_dim, n_comp, 1]
     q = ggml_permute(ctx, q, 0, 2, 1, 3);                     // [head_dim, n_tokens, n_heads]
 
