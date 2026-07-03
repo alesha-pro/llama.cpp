@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -264,6 +265,18 @@ static bool dsv4_topk_gather_disabled() {
 // the decode graph replays in between instead of recapturing every boundary.
 static constexpr int64_t DSV4_CS_BUCKET = 2048;
 
+// GPU-built masks for the multi-token (prompt-chunk) paths. The CPU input
+// masks cost an O(width x n_tokens) -INF fill + PCIe upload per ubatch (the
+// dominant CPU-side quadratic term of long prefills: at 200K ctx the indexer
+// causal mask alone is ~400 MB per 2048-token ubatch). Built on GPU from
+// inp_pos with plain ggml ops instead. env DSV4_NO_GPU_MASKS reverts.
+static bool dsv4_gpu_masks_disabled() {
+    static const bool v = getenv("DSV4_NO_GPU_MASKS") != nullptr;
+    return v;
+}
+
+// (dsv4_gpu_mask_comp_causal is defined below, after the scalar helpers.)
+
 class dsv4_graph_inputs : public llm_graph_input_i {
 public:
     ggml_tensor * add_mask(
@@ -307,6 +320,18 @@ public:
             }
         }
         presence.push_back({ ratio, has_comp });
+    }
+
+    // Multi-token (prompt-chunk) graphs with GPU-built masks have no input
+    // mask left to fail can_reuse when n_comp_visible grows -> record the
+    // built width and force a rebuild when the expected width changes.
+    void note_comp_width(int64_t ratio, int64_t width) {
+        for (const auto & e : widths) {
+            if (e.ratio == ratio) {
+                return;
+            }
+        }
+        widths.push_back({ ratio, width });
     }
 
     // Create a 1-element scalar INPUT whose value is recomputed each token from
@@ -431,6 +456,13 @@ public:
                 return false;
             }
         }
+        // Chunk graphs with GPU-built masks: rebuild when the visible width
+        // changes (see note_comp_width).
+        for (const auto & e : widths) {
+            if (e.ratio > 0 && (last_pos + 1) / e.ratio != e.width) {
+                return false;
+            }
+        }
         for (const auto & m : masks) {
             if (m.tensor == nullptr || m.tensor->ne[1] != nt) {
                 return false;
@@ -517,9 +549,15 @@ private:
         bool    has_comp;
     };
 
+    struct dsv4_width_entry {
+        int64_t ratio;
+        int64_t width;
+    };
+
     std::vector<dsv4_mask_entry> masks;
     std::vector<dsv4_index_entry> indices;
     std::vector<dsv4_presence_entry> presence;
+    std::vector<dsv4_width_entry> widths;
 };
 
 struct dsv4_rope_cfg {
@@ -563,6 +601,24 @@ static ggml_tensor * dsv4_new_filled_2d(ggml_context * ctx, int64_t n0, int64_t 
 
 static ggml_tensor * dsv4_new_filled_3d(ggml_context * ctx, int64_t n0, int64_t n1, int64_t n2, float value) {
     return ggml_fill(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n0, n1, n2), value);
+}
+
+// mask[i, q] = i < (pos_q + 1)/ratio ? 0 : -1e9   (compressed causal), on GPU.
+// i < (p+1)/r  <=>  (i+1)*r <= p+1  <=>  p + 1.5 - (i+1)*r > 0 for integers.
+static ggml_tensor * dsv4_gpu_mask_comp_causal(
+        ggml_context * ctx,
+        ggml_tensor  * pos,      // i32 [n_tokens]
+        int64_t        n_comp,
+        int64_t        ratio,
+        int64_t        n_tokens) {
+    ggml_tensor * ar = ggml_arange(ctx, 1.0f, (float) n_comp + 0.5f, 1.0f);   // [n_comp] = i+1
+    ar = dsv4_mul_scalar(ctx, ar, -(float) ratio);                            // -(i+1)*ratio
+    ar = ggml_repeat_4d(ctx, ggml_reshape_2d(ctx, ar, n_comp, 1), n_comp, n_tokens, 1, 1);
+    ggml_tensor * pf = ggml_cast(ctx, pos, GGML_TYPE_F32);                    // [n_tokens]
+    pf = dsv4_add_scalar(ctx, pf, 1.5f);                                      // p + 1.5
+    pf = ggml_reshape_2d(ctx, pf, 1, n_tokens);
+    ggml_tensor * vis = ggml_step(ctx, ggml_add(ctx, ar, pf));                // 1 if visible
+    return dsv4_mul_scalar(ctx, dsv4_add_scalar(ctx, vis, -1.0f), 1.0e9f);    // 0 / -1e9
 }
 
 static dsv4_state_layout dsv4_make_state_layout(int64_t compress_ratio, int64_t head_dim) {
@@ -1292,6 +1348,141 @@ static dsv4_decode_compressor dsv4_build_compressor_decode_chunk(
     return { kv_state, score_state, kv_comp };
 }
 
+// Kill-switch for the batched prompt-chunk compressor below.
+static bool dsv4_batched_chunk_disabled() {
+    static const bool v = getenv("DSV4_NO_BATCHED_CHUNK") != nullptr;
+    return v;
+}
+
+// Batched replacement for dsv4_build_compressor_decode_chunk on ratio-ALIGNED
+// prompt chunks (pos[0] % ratio == 0 && n_tokens % ratio == 0). The per-token
+// loop builds a full compressor subgraph per token (~1000 graph objects and
+// ~1000 kernel launches per token -> ~500K per 512-token ubatch; ggml arena
+// overflow at ubatch >= 1024, and the launch spam keeps the GPUs ~90% idle
+// during prefill). This pools every compression window of the ubatch at once,
+// exactly like the pos-0 prefill path (dsv4_build_compressor_prefill), with
+// two additions: the ratio-4 overlap window of chunk 0 is SEEDED from the
+// carried recurrent state (rows [0, ratio) hold the previous ubatch's last
+// full window), and the end state is emitted like
+// dsv4_build_compressor_prefill_state does for the aligned case.
+static dsv4_decode_compressor dsv4_build_compressor_chunk_batched(
+        ggml_context       * ctx,
+        ggml_tensor        * x,
+        ggml_tensor        * prev_kv_state,
+        ggml_tensor        * prev_score_state,
+        ggml_tensor        * wkv,
+        ggml_tensor        * wgate,
+        ggml_tensor        * ape,
+        ggml_tensor        * norm,
+        int64_t              head_dim,
+        int64_t              n_rot,
+        llama_pos            first_pos,
+        int64_t              n_tokens,
+        int64_t              compress_ratio,
+        int                  rope_type,
+        const dsv4_rope_cfg & rope_cfg,
+        float                norm_eps) {
+    const dsv4_state_layout layout = dsv4_make_state_layout(compress_ratio, head_dim);
+    const int64_t n_comp = n_tokens / compress_ratio;
+    const int64_t coff   = compress_ratio == 4 ? 2 : 1;
+    const int64_t n_kv   = coff * head_dim;
+
+    GGML_ASSERT(first_pos % compress_ratio == 0);
+    GGML_ASSERT(n_comp > 0 && n_comp * compress_ratio == n_tokens);
+    GGML_ASSERT(layout.width == n_kv);
+
+    ggml_tensor * kv_all = ggml_mul_mat(ctx, wkv,   x); // [width, n_tokens]
+    ggml_tensor * sc_all = ggml_mul_mat(ctx, wgate, x);
+    ggml_tensor * ape_f  = ape->type == GGML_TYPE_F32 ? ape : ggml_cast(ctx, ape, GGML_TYPE_F32);
+
+    // ---- pooled compressed rows (mirrors dsv4_build_compressor_prefill) ----
+    ggml_tensor * kv = ggml_view_3d(ctx, kv_all, n_kv, compress_ratio, n_comp,
+            kv_all->nb[1], kv_all->nb[1] * compress_ratio, 0);
+    ggml_tensor * score = ggml_view_3d(ctx, sc_all, n_kv, compress_ratio, n_comp,
+            sc_all->nb[1], sc_all->nb[1] * compress_ratio, 0);
+    score = ggml_add(ctx, score, ggml_repeat(ctx, ape_f, score));
+
+    ggml_tensor * kv_comp = nullptr;
+    if (coff == 1) {
+        ggml_tensor * kv_p = ggml_cont(ctx, ggml_permute(ctx, kv,    1, 0, 2, 3)); // [ratio, head_dim, n_comp]
+        ggml_tensor * sc_p = ggml_cont(ctx, ggml_permute(ctx, score, 1, 0, 2, 3));
+        kv_comp = dsv4_softmax_pool_ratio(ctx, kv_p, sc_p);                        // [head_dim, n_comp]
+    } else {
+        ggml_tensor * kv_prev = ggml_view_3d(ctx, kv, head_dim, compress_ratio, n_comp,
+                kv->nb[1], kv->nb[2], 0);
+        ggml_tensor * kv_curr = ggml_view_3d(ctx, kv, head_dim, compress_ratio, n_comp,
+                kv->nb[1], kv->nb[2], head_dim * kv->nb[0]);
+        ggml_tensor * score_prev = ggml_view_3d(ctx, score, head_dim, compress_ratio, n_comp,
+                score->nb[1], score->nb[2], 0);
+        ggml_tensor * score_curr = ggml_view_3d(ctx, score, head_dim, compress_ratio, n_comp,
+                score->nb[1], score->nb[2], head_dim * score->nb[0]);
+
+        // Chunk-0 overlap comes from the carried state instead of a zero pad:
+        // state rows [0, ratio) are the previous ubatch's last full window
+        // (score rows already carry their APE), take their first-half slice
+        // like the in-batch prev views do.
+        ggml_tensor * seed_kv = ggml_view_3d(ctx, prev_kv_state, head_dim, compress_ratio, 1,
+                prev_kv_state->nb[1], prev_kv_state->nb[1] * compress_ratio, 0);
+        ggml_tensor * seed_sc = ggml_view_3d(ctx, prev_score_state, head_dim, compress_ratio, 1,
+                prev_score_state->nb[1], prev_score_state->nb[1] * compress_ratio, 0);
+
+        if (n_comp == 1) {
+            kv_prev    = seed_kv;
+            score_prev = seed_sc;
+        } else {
+            ggml_tensor * kv_prev_hi = ggml_view_3d(ctx, kv, head_dim, compress_ratio, n_comp - 1,
+                    kv->nb[1], kv->nb[2], 0);
+            ggml_tensor * sc_prev_hi = ggml_view_3d(ctx, score, head_dim, compress_ratio, n_comp - 1,
+                    score->nb[1], score->nb[2], 0);
+            kv_prev    = ggml_concat(ctx, seed_kv, kv_prev_hi, 2);
+            score_prev = ggml_concat(ctx, seed_sc, sc_prev_hi, 2);
+        }
+
+        kv_prev    = ggml_cont(ctx, ggml_permute(ctx, kv_prev,    1, 0, 2, 3)); // [ratio, head_dim, n_comp]
+        kv_curr    = ggml_cont(ctx, ggml_permute(ctx, kv_curr,    1, 0, 2, 3));
+        score_prev = ggml_cont(ctx, ggml_permute(ctx, score_prev, 1, 0, 2, 3));
+        score_curr = ggml_cont(ctx, ggml_permute(ctx, score_curr, 1, 0, 2, 3));
+
+        ggml_tensor * kv_pool = ggml_concat(ctx, kv_prev,    kv_curr,    0);    // [2*ratio, head_dim, n_comp]
+        ggml_tensor * sc_pool = ggml_concat(ctx, score_prev, score_curr, 0);
+        kv_comp = dsv4_softmax_pool_ratio(ctx, kv_pool, sc_pool);               // [head_dim, n_comp]
+    }
+
+    kv_comp = ggml_rms_norm(ctx, kv_comp, norm_eps);
+    kv_comp = ggml_mul(ctx, kv_comp, norm);
+    kv_comp = ggml_reshape_3d(ctx, kv_comp, head_dim, 1, n_comp);
+
+    // RoPE positions of the emitted rows = first token of each window.
+    ggml_tensor * comp_pos = ggml_arange(ctx, (float) first_pos,
+            (float) (first_pos + n_comp * compress_ratio), (float) compress_ratio);
+    comp_pos = ggml_cast(ctx, comp_pos, GGML_TYPE_I32);
+    kv_comp = dsv4_apply_rope_tail(ctx, kv_comp, comp_pos,
+            head_dim, 1, n_comp, n_rot, rope_type,
+            rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
+            rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, false);
+
+    // ---- end state (mirrors dsv4_build_compressor_prefill_state, aligned) ----
+    ggml_tensor * last_kv = ggml_view_2d(ctx, kv_all, layout.width, compress_ratio,
+            kv_all->nb[1], (n_tokens - compress_ratio) * kv_all->nb[1]);
+    ggml_tensor * last_sc = ggml_view_2d(ctx, sc_all, layout.width, compress_ratio,
+            sc_all->nb[1], (n_tokens - compress_ratio) * sc_all->nb[1]);
+    last_sc = ggml_add(ctx, last_sc, ape_f);
+
+    ggml_tensor * kv_state    = nullptr;
+    ggml_tensor * score_state = nullptr;
+    if (compress_ratio == 4) {
+        // [prev full window | empty current partial window]
+        kv_state    = ggml_concat(ctx, last_kv, dsv4_new_filled_2d(ctx, layout.width, compress_ratio, 0.0f), 1);
+        score_state = ggml_concat(ctx, last_sc, dsv4_new_filled_2d(ctx, layout.width, compress_ratio, -INFINITY), 1);
+    } else {
+        // ratio-128 state holds only the current partial window; aligned end -> empty.
+        kv_state    = dsv4_new_filled_2d(ctx, layout.width, compress_ratio, 0.0f);
+        score_state = dsv4_new_filled_2d(ctx, layout.width, compress_ratio, -INFINITY);
+    }
+
+    return { kv_state, score_state, kv_comp };
+}
+
 static ggml_tensor * dsv4_build_indexer_scores_prefill(
         ggml_context       * ctx,
         ggml_tensor        * x,
@@ -1428,6 +1619,20 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             res->add_input(std::move(inputs));
         }
         return inp_dsv4;
+    };
+
+    // Cache of GPU-built causal comp masks, shared across layers of the same
+    // ratio/width (all ratio-4 layers see one mask, all ratio-128 another).
+    std::vector<std::tuple<int64_t, int64_t, ggml_tensor *>> gpu_comp_masks;
+    auto get_gpu_comp_mask = [&](int64_t width, int64_t ratio) -> ggml_tensor * {
+        for (const auto & [r, w, t] : gpu_comp_masks) {
+            if (r == ratio && w == width) {
+                return t;
+            }
+        }
+        ggml_tensor * m = dsv4_gpu_mask_comp_causal(ctx0, inp_pos, width, ratio, n_tokens);
+        gpu_comp_masks.emplace_back(ratio, width, m);
+        return m;
     };
 
     inpL = ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens);
@@ -1692,6 +1897,14 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 ggml_tensor * cs_comp_row = cs_compressor
                     ? get_dsv4_inputs()->add_comp_row_index(ctx0, compress_ratio, n_comp_cache - 1, "dsv4_cs_comp_row") : nullptr;
 
+                // Ratio-aligned prompt chunks take the BATCHED compressor (one
+                // pooled subgraph for the whole ubatch) instead of the per-token
+                // loop; unaligned tail chunks fall back to the loop.
+                const bool chunk_aligned = n_tokens > 1 && ubatch.pos != nullptr
+                    && first_pos % compress_ratio == 0
+                    && n_tokens % compress_ratio == 0
+                    && !dsv4_batched_chunk_disabled();
+
                 ggml_tensor * attn_ape_idx = n_tokens == 1
                     ? get_dsv4_inputs()->add_index(ctx0, compress_ratio, 0, "dsv4_attn_ape_idx") : nullptr;
                 ggml_tensor * attn_row_idx = n_tokens == 1
@@ -1715,6 +1928,22 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             attn_row_idx,
                             cs_comp_pos,
                             cs_boundary)
+                    : chunk_aligned
+                    ? dsv4_build_compressor_chunk_batched(ctx0, cur,
+                            prev_attn_kv_state,
+                            prev_attn_sc_state,
+                            layer.attn_compressor_kv,
+                            layer.attn_compressor_gate,
+                            layer.attn_compressor_ape,
+                            layer.attn_compressor_norm,
+                            n_embd_head_k,
+                            n_rot,
+                            first_pos,
+                            n_tokens,
+                            compress_ratio,
+                            rope_type,
+                            rope_cfg,
+                            norm_rms_eps)
                     : dsv4_build_compressor_decode_chunk(ctx0, cur,
                             prev_attn_kv_state,
                             prev_attn_sc_state,
@@ -1807,6 +2036,22 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                     idx_row_idx,
                                     cs_comp_pos,
                                     cs_boundary)
+                            : chunk_aligned
+                            ? dsv4_build_compressor_chunk_batched(ctx0, cur,
+                                    prev_index_kv_state,
+                                    prev_index_sc_state,
+                                    layer.indexer_compressor_kv,
+                                    layer.indexer_compressor_gate,
+                                    layer.indexer_compressor_ape,
+                                    layer.indexer_compressor_norm,
+                                    hparams.indexer_head_size,
+                                    n_rot,
+                                    first_pos,
+                                    n_tokens,
+                                    compress_ratio,
+                                    rope_type,
+                                    rope_cfg,
+                                    norm_rms_eps)
                             : dsv4_build_compressor_decode_chunk(ctx0, cur,
                                     prev_index_kv_state,
                                     prev_index_sc_state,
@@ -1870,7 +2115,14 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                         layer.indexer_attn_q_b,
                                         layer.indexer_proj,
                                         inp_pos,
-                                        get_dsv4_inputs()->add_mask(ctx0,
+                                        // Prompt-chunk path: the causal indexer mask is
+                                        // O(n_comp_visible x n_tokens) -> build it on GPU
+                                        // (shared across layers) instead of a CPU-filled
+                                        // input; note_comp_width() takes over reuse gating.
+                                        !dsv4_gpu_masks_disabled()
+                                            ? (get_dsv4_inputs()->note_comp_width(compress_ratio, n_comp_visible),
+                                               get_gpu_comp_mask(n_comp_visible, compress_ratio))
+                                            : get_dsv4_inputs()->add_mask(ctx0,
                                                 dsv4_mask_kind::COMPRESS_CAUSAL,
                                                 n_comp_visible, n_tokens,
                                                 0, n_comp_visible, 0, compress_ratio,
@@ -1926,11 +2178,18 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             }
                         }
                     } else {
-                        comp_mask = get_dsv4_inputs()->add_mask(ctx0,
-                                dsv4_mask_kind::COMPRESS_CAUSAL,
-                                n_comp_visible, n_tokens,
-                                0, n_comp_visible, 0, compress_ratio,
-                                "dsv4_attn_compress_mask");
+                        if (n_tokens > 1 && !dsv4_gpu_masks_disabled()) {
+                            // Prompt-chunk path: GPU-built causal mask (shared
+                            // across layers); reuse gated by note_comp_width.
+                            get_dsv4_inputs()->note_comp_width(compress_ratio, n_comp_visible);
+                            comp_mask = get_gpu_comp_mask(n_comp_visible, compress_ratio);
+                        } else {
+                            comp_mask = get_dsv4_inputs()->add_mask(ctx0,
+                                    dsv4_mask_kind::COMPRESS_CAUSAL,
+                                    n_comp_visible, n_tokens,
+                                    0, n_comp_visible, 0, compress_ratio,
+                                    "dsv4_attn_compress_mask");
+                        }
                     }
 
                     attn_mask = ggml_concat(ctx0, attn_mask, comp_mask, 0);

@@ -2097,7 +2097,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         // count is much smaller than the number of GGML objects allocated while
         // building those graphs, so reserve a larger metadata arena than the
         // generic tensor-count heuristic would provide.
-        return std::max<uint32_t>(524288u, n_tokens * 192 + 64u * model.n_tensors());
+        return std::max<uint32_t>(524288u, n_tokens * 768 + 64u * model.n_tensors());
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
     for (const auto & lora : model.loras) {
