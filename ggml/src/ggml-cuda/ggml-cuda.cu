@@ -3410,6 +3410,12 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            if (!res && getenv("DSV4_GRAPH_DBG")) {
+                GGML_LOG_INFO("DSV4GDBG: props changed at node %d/%d op=%s name=%s (key=%p uid=%zu)
+",
+                    i, cgraph->n_nodes, ggml_op_name(cgraph->nodes[i]->op), cgraph->nodes[i]->name,
+                    graph_key, (size_t)cgraph->uid);
+            }
             graph->node_props[i] = prop;
             res = true;
         }
@@ -4567,7 +4573,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
                     graph->warmup_complete = true;
-                    GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
+                    if (getenv("DSV4_GRAPH_DBG")) {
+                        GGML_LOG_INFO("DSV4GDBG: warmup COMPLETE key=%p uid=%zu n=%d first=%s
+",
+                            graph_key, (size_t)cgraph->uid, cgraph->n_nodes, cgraph->nodes[0]->name);
+                    }
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
                 }
@@ -4577,7 +4587,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
-                    GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                    if (getenv("DSV4_GRAPH_DBG")) {
+                        GGML_LOG_INFO("DSV4GDBG: warmup RESET key=%p uid=%zu n=%d first=%s
+",
+                            graph_key, (size_t)cgraph->uid, cgraph->n_nodes, cgraph->nodes[0]->name);
+                    }
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;

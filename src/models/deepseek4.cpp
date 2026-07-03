@@ -276,11 +276,37 @@ public:
             int64_t        window,
             int64_t        ratio,
             const char   * name) {
+        // Dedup by full parameter tuple: set_input fills the content purely from
+        // (kind, ratio, window, shape, ubatch), so equal params => equal content.
+        // Every layer sharing one tensor removes ~40 duplicate CPU mask fills +
+        // uploads per token and the extra graph splits they caused.
+        for (const auto & me : masks) {
+            if (me.kind == kind && me.tensor->ne[0] == n0 && me.tensor->ne[1] == n1 &&
+                me.n_raw == n_raw && me.n_comp == n_comp && me.window == window &&
+                me.ratio == ratio) {
+                return me.tensor;
+            }
+        }
         ggml_tensor * t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n0, n1, 1, 1);
         ggml_set_input(t);
         ggml_set_name(t, name);
         masks.push_back({ t, kind, n_raw, n_comp, window, ratio });
         return t;
+    }
+
+    // Record whether the graph was BUILT with the compressed-attention branch
+    // for a given ratio (n_comp_visible > 0 at build time). Without this,
+    // a decode graph built at pos < ratio (no comp branch, no comp masks) is
+    // reused forever: nothing ever fails can_reuse, so layers with that ratio
+    // never start attending their compressed cache (silent long-context loss
+    // + deceptively fast decode).
+    void note_comp_presence(int64_t ratio, bool has_comp) {
+        for (const auto & e : presence) {
+            if (e.ratio == ratio) {
+                return;
+            }
+        }
+        presence.push_back({ ratio, has_comp });
     }
 
     // Create a 1-element scalar INPUT whose value is recomputed each token from
@@ -397,6 +423,14 @@ public:
         const auto & ub = params.ubatch;
         const int64_t nt = ub.n_tokens;
         const llama_pos last_pos = ub.pos ? ub.pos[nt - 1] : (llama_pos)(nt - 1);
+        // The comp branch must appear the moment n_comp_visible crosses 0 for
+        // any ratio -> force a rebuild (see note_comp_presence).
+        for (const auto & e : presence) {
+            const bool now = e.ratio > 0 && ((last_pos + 1) / e.ratio) > 0;
+            if (now != e.has_comp) {
+                return false;
+            }
+        }
         for (const auto & m : masks) {
             if (m.tensor == nullptr || m.tensor->ne[1] != nt) {
                 return false;
@@ -478,8 +512,14 @@ private:
         }
     }
 
+    struct dsv4_presence_entry {
+        int64_t ratio;
+        bool    has_comp;
+    };
+
     std::vector<dsv4_mask_entry> masks;
     std::vector<dsv4_index_entry> indices;
+    std::vector<dsv4_presence_entry> presence;
 };
 
 struct dsv4_rope_cfg {
@@ -1606,6 +1646,12 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 const int64_t n_comp_visible = (last_pos + 1) / compress_ratio;
                 const int64_t n_comp_cache = mctx_dsv4->get_dsv4_n_comp(il);
                 GGML_ASSERT(n_comp_visible <= n_comp_cache);
+
+                // Force a rebuild when n_comp_visible crosses 0 for this ratio:
+                // a graph built without the comp branch must not be reused once
+                // compressed rows become visible (else these layers silently
+                // never attend their compressed cache).
+                get_dsv4_inputs()->note_comp_presence(compress_ratio, n_comp_visible > 0);
 
                 // Constant-shape decode (env DSV4_CONSTANT_SHAPE): shared by the
                 // attn+index compressors AND the attention cache view/mask below.
