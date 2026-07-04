@@ -1722,7 +1722,9 @@ static ggml_tensor * dsv4_build_indexer_scores_prefill(
         int64_t              n_tokens,
         int64_t              n_rot,
         int                  rope_type,
-        const dsv4_rope_cfg & rope_cfg) {
+        const dsv4_rope_cfg & rope_cfg,
+        int32_t              skip_pos0     = -1,
+        int32_t              skip_ratio    = 0) {
     ggml_tensor * q = ggml_mul_mat(ctx, wq_b, qr);
     q = ggml_reshape_3d(ctx, q, n_index_head_size, n_index_head, n_tokens);
     q = dsv4_apply_rope_tail(ctx, q, pos,
@@ -1742,6 +1744,16 @@ static ggml_tensor * dsv4_build_indexer_scores_prefill(
         ggml_tensor * score = ggml_lightning_indexer(ctx, q, index_kv, w,
                 1.0f / std::sqrt((float) n_index_head_size),
                 1.0f / std::sqrt((float) n_index_head));
+        // DSV4_IDX_SKIP=1: let the CUDA kernel skip causally-invisible KV
+        // blocks (n_visible = (pos + 1) / ratio, same formula as
+        // fill_compress_causal - the skipped scores are written as 0.0f and
+        // the causal_mask add below turns them into -INF just like before)
+        static const bool idx_skip = getenv("DSV4_IDX_SKIP") != nullptr;
+        if (idx_skip && skip_pos0 >= 0 && skip_ratio > 0) {
+            score->op_params[2] = skip_pos0;
+            score->op_params[3] = skip_ratio;
+            score->op_params[4] = 1;
+        }
         score = ggml_reshape_2d(ctx, score, index_kv->ne[2], n_tokens);
         return ggml_add(ctx, score, causal_mask);
     }
@@ -2257,7 +2269,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             n_tokens,
                             n_rot,
                             rope_type,
-                            rope_cfg);
+                            rope_cfg,
+                            ubatch.pos ? (int32_t) ubatch.pos[0] : (int32_t) -1,
+                            (int32_t) compress_ratio);
                     cb(index_scores, "indexer_scores", il);
 
                     const int top_k = std::min<int64_t>(hparams.indexer_top_k, n_comp);
