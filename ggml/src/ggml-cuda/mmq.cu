@@ -3,6 +3,9 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+#include <algorithm>
+#include <vector>
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -217,12 +220,44 @@ void ggml_cuda_mul_mat_q(
     // ne12 would skip that expert's tail tiles -> silently wrong output. ne_get_rows is the safe upper
     // bound on any single expert's columns; stream-k skips the (mostly empty) extra tiles cheaply via
     // the jt*mmq_x>=col_diff check (the resulting overhead is within run-to-run noise).
+    int64_t ncols_max = ne_get_rows;
+
+    // DSV4_MOE_TILE=1: use the ACTUAL largest per-expert column count instead
+    // of the worst-case bound. At ubatch 512 / 256 experts / top-8 the mean
+    // bucket is ~16 columns while ne_get_rows is 4096 - the mmq_x selector
+    // then picks 128-wide token tiles that are ~87% dead MACs. expert_bounds
+    // already accounts for duplicate slots, so max(diff) is exact, not a
+    // heuristic. Costs one 1KB D2H copy + stream sync per mul_mat_id call -
+    // skipped during CUDA graph capture (sync is forbidden there) and for
+    // small batches where the bound is tight anyway.
+    static const bool moe_tile = getenv("DSV4_MOE_TILE") != nullptr;
+    if (moe_tile && ne12 >= 64) {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &cap));
+        if (cap == cudaStreamCaptureStatusNone) {
+            std::vector<int32_t> eb(ne02 + 1);
+            CUDA_CHECK(cudaMemcpyAsync(eb.data(), expert_bounds.get(), (ne02 + 1)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            int32_t max_col_diff = 1;
+            for (int64_t i = 0; i < ne02; ++i) {
+                max_col_diff = std::max(max_col_diff, eb[i+1] - eb[i]);
+            }
+            ncols_max = max_col_diff;
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                fprintf(stderr, "%s: DSV4_MOE_TILE=1 - per-expert ncols_max engaged (max_col_diff=%d vs bound %lld)\n",
+                        __func__, max_col_diff, (long long) ne_get_rows);
+            }
+        }
+    }
+
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        use_stream_k, ne_get_rows};
+        use_stream_k, ncols_max};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
