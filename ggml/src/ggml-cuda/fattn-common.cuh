@@ -24,7 +24,28 @@ struct fattn_perf_hints {
     int32_t * __restrict__ top_k;
     // top_k row length, other dimensions are the same as mask
     int32_t n_top_k;
+    // DSV4_FA_UNION: top_k is a per-Q-tile UNION list [n_top_k, n_tiles]
+    // instead of per-token; top_k_memb bit j marks membership of the row in
+    // query j of the tile (rows with a 0 bit are forced to -INF in the mask)
+    const uint8_t * __restrict__ top_k_memb;
+    int32_t top_k_per_tile;
 };
+
+// side-channel from the DSV4_FA_UNION preparation step (fattn.cu) into
+// launch_fattn: the ggml-cuda graph executes on a single thread, the buffers
+// are consumed (and the flag cleared) by the launch_fattn call immediately
+// following the union build
+struct dsv4_fa_union_buffers {
+    bool            active;
+    const int32_t * idx;    // [cap, n_tiles] address-sorted union rows
+    const uint8_t * memb;   // [cap, n_tiles] membership bits per query
+    const int     * kv_max; // [n_tiles] padded per-tile row counts
+    int             cap;
+};
+static inline dsv4_fa_union_buffers & dsv4_fa_union_ctx() {
+    static thread_local dsv4_fa_union_buffers buffers = {};
+    return buffers;
+}
 
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
@@ -1207,10 +1228,21 @@ void launch_fattn(
     // TODO other tensor dimensions after removal of WMMA kernel:
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
-    struct fattn_perf_hints perf_hints = {nullptr, 0};
+    struct fattn_perf_hints perf_hints = {nullptr, 0, nullptr, 0};
     if (top_k) {
         perf_hints.top_k = (int32_t*) top_k->data;
         perf_hints.n_top_k = top_k->ne[0];
+    }
+
+    const int * KV_max_ptr = KV_max.ptr;
+    dsv4_fa_union_buffers & uctx = dsv4_fa_union_ctx();
+    if (top_k && uctx.active) {
+        perf_hints.top_k          = (int32_t *) uctx.idx;
+        perf_hints.n_top_k        = uctx.cap;
+        perf_hints.top_k_memb     = uctx.memb;
+        perf_hints.top_k_per_tile = 1;
+        KV_max_ptr  = uctx.kv_max;
+        uctx.active = false;
     }
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
@@ -1220,7 +1252,7 @@ void launch_fattn(
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
-        KV_max.ptr,
+        KV_max_ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],

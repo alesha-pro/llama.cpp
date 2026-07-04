@@ -49,6 +49,123 @@ static void dsv4_topk_union_stats(ggml_backend_cuda_context & ctx, const ggml_te
     fprintf(stderr, "\n");
 }
 
+// DSV4_FA_UNION=1: build per-Q-tile (8 queries) UNION lists out of the
+// per-token top-k lists, so the FA kernel can run ncols1=8 and amortize the
+// gathered K/V loads across the tile. Union telemetry showed tile-8 unions
+// are only 1.5-2.2x a single list. One block builds one tile:
+// bitmap-mark -> ordered compaction (prefix scan) -> membership bits via
+// binary search. Rows not in a query's own list get membership bit 0 and are
+// forced to -INF by load_mask (the shared causal mask cannot express that).
+static __global__ void dsv4_topk_union_build_kernel(
+        const int32_t * __restrict__ top_k, // [n_top_k, n_tokens]
+        const int n_top_k, const int n_tokens, const int n_rows, const int cap,
+        int32_t * __restrict__ u_idx,   // [cap, n_tiles] address-sorted rows
+        uint8_t * __restrict__ u_memb,  // [cap, n_tiles] membership bits
+        int     * __restrict__ u_n,     // [n_tiles] padded row counts
+        int     * __restrict__ overflow) {
+    constexpr int NC = 8;
+    extern __shared__ char smem_raw[];
+    const int n_words = (n_rows + 31) / 32;
+    uint32_t * bitmap = (uint32_t *) smem_raw;                    // n_words
+    int      * psum   = (int *) (bitmap + n_words);               // blockDim.x + 1
+    uint32_t * membs  = (uint32_t *) (psum + blockDim.x + 1);     // cap
+
+    const int tile = blockIdx.x;
+    const int tid  = threadIdx.x;
+    const int nthr = blockDim.x;
+    const int t0   = tile * NC;
+
+    for (int w = tid; w < n_words; w += nthr) {
+        bitmap[w] = 0;
+    }
+    for (int c = tid; c < cap; c += nthr) {
+        membs[c] = 0;
+    }
+    __syncthreads();
+
+    for (int e = tid; e < NC*n_top_k; e += nthr) {
+        const int j = e / n_top_k;
+        // OOB tile positions wrap to an early token - EXACTLY like the
+        // kernel's fastmodulo(j0 + j_sram, ne01) column wrap; the duplicate
+        // column then recomputes that token with a consistent mask and its
+        // output overwrite is a no-op (all-zero membership would give an
+        // all -INF column -> NaN overwriting a valid early token's output)
+        const int t = (t0 + j) % n_tokens;
+        const int r = top_k[(size_t) t*n_top_k + e % n_top_k];
+        atomicOr(&bitmap[r >> 5], 1u << (r & 31));
+    }
+    __syncthreads();
+
+    const int chunk = (n_words + nthr - 1) / nthr;
+    const int w0    = min(n_words, tid * chunk);
+    const int w1    = min(n_words, w0 + chunk);
+    int local = 0;
+    for (int w = w0; w < w1; ++w) {
+        local += __popc(bitmap[w]);
+    }
+    psum[tid + 1] = local;
+    if (tid == 0) {
+        psum[0] = 0;
+    }
+    __syncthreads();
+    if (tid == 0) { // 256 additions - not worth a parallel scan
+        for (int i = 1; i <= nthr; ++i) {
+            psum[i] += psum[i-1];
+        }
+    }
+    __syncthreads();
+    const int total = psum[nthr];
+
+    int base = psum[tid];
+    for (int w = w0; w < w1; ++w) {
+        uint32_t bits = bitmap[w];
+        while (bits) {
+            const int b = __ffs(bits) - 1;
+            bits &= bits - 1;
+            if (base < cap) {
+                u_idx[(size_t) tile*cap + base] = w*32 + b;
+            }
+            ++base;
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        atomicMax(overflow, total);
+        u_n[tile] = min(cap, ((total + 31) / 32) * 32);
+    }
+    if (total > cap) {
+        return; // whole call falls back to the per-token path
+    }
+
+    const int padded = ((total + 31) / 32) * 32;
+    for (int p = total + tid; p < padded; p += nthr) {
+        // pad with the first union row; membership stays 0 -> forced -INF
+        u_idx[(size_t) tile*cap + p] = u_idx[(size_t) tile*cap];
+    }
+    __syncthreads();
+
+    for (int e = tid; e < NC*n_top_k; e += nthr) {
+        const int j = e / n_top_k;
+        const int t = (t0 + j) % n_tokens; // same wrap as the mark phase
+        const int r = top_k[(size_t) t*n_top_k + e % n_top_k];
+        int lo = 0, hi = total - 1;
+        while (lo < hi) {
+            const int mid = (lo + hi) >> 1;
+            if (u_idx[(size_t) tile*cap + mid] < r) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        atomicOr(&membs[lo], 1u << j);
+    }
+    __syncthreads();
+    for (int c = tid; c < padded; c += nthr) {
+        u_memb[(size_t) tile*cap + c] = (uint8_t) membs[c];
+    }
+}
+
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED_VARS(ctx);
     const ggml_tensor * Q = dst->src[0];
@@ -85,6 +202,69 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
             if (union_stats && dst->src[0]->ne[1] > 1) {
                 dsv4_topk_union_stats(ctx, dst->src[5]);
             }
+
+            static const bool fa_union = getenv("DSV4_FA_UNION") != nullptr;
+            // the overflow check below needs a stream sync - forbidden while
+            // CUDA graph capture is active (e.g. small continuation batches),
+            // fall back to the per-token path there
+            cudaStreamCaptureStatus fa_union_cap = cudaStreamCaptureStatusNone;
+            if (fa_union) {
+                CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &fa_union_cap));
+            }
+            // ragged chunks (the prompt tail) keep the per-token path: the
+            // kernel wraps OOB tile columns via fastmodulo and the wrapped
+            // columns' interaction with per-tile union lists proved fragile
+            if (fa_union && fa_union_cap == cudaStreamCaptureStatusNone && Q->ne[1] >= 8 && Q->ne[1] % 8 == 0) {
+                const ggml_tensor * top_k = dst->src[5];
+                const int n_top_k  = top_k->ne[0];
+                const int n_tokens = top_k->ne[1];
+                const int n_rows   = dst->src[1]->ne[1];
+                const int n_tiles  = (n_tokens + 7) / 8;
+                const int cap      = ((3*n_top_k + 31) / 32) * 32;
+
+                ggml_cuda_pool_alloc<int32_t> u_idx (ctx.pool(), (size_t) cap*n_tiles);
+                ggml_cuda_pool_alloc<uint8_t> u_memb(ctx.pool(), (size_t) cap*n_tiles);
+                ggml_cuda_pool_alloc<int>     u_n   (ctx.pool(), n_tiles + 1); // [+1] = overflow slot
+
+                CUDA_CHECK(cudaMemsetAsync(u_n.ptr + n_tiles, 0, sizeof(int), ctx.stream()));
+                const int    n_words = (n_rows + 31) / 32;
+                const size_t smem    = n_words*sizeof(uint32_t) + (256 + 1)*sizeof(int) + (size_t) cap*sizeof(uint32_t);
+                dsv4_topk_union_build_kernel<<<n_tiles, 256, smem, ctx.stream()>>>(
+                    (const int32_t *) top_k->data, n_top_k, n_tokens, n_rows, cap,
+                    u_idx.ptr, u_memb.ptr, u_n.ptr, u_n.ptr + n_tiles);
+                CUDA_CHECK(cudaGetLastError());
+
+                int max_union = 0;
+                CUDA_CHECK(cudaMemcpyAsync(&max_union, u_n.ptr + n_tiles, sizeof(int), cudaMemcpyDeviceToHost, ctx.stream()));
+                CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+
+                if (max_union <= cap) {
+                    static bool logged_union = false;
+                    if (!logged_union) {
+                        logged_union = true;
+                        fprintf(stderr, "%s: engaging UNION sparse top-k FA (ncols1=8, cap=%d, max_union=%d)\n",
+                                __func__, cap, max_union);
+                    }
+                    dsv4_fa_union_buffers & uctx = dsv4_fa_union_ctx();
+                    uctx.active = true;
+                    uctx.idx    = u_idx.ptr;
+                    uctx.memb   = u_memb.ptr;
+                    uctx.kv_max = u_n.ptr;
+                    uctx.cap    = cap;
+                    // pool buffers are freed on scope exit AFTER the launch
+                    // inside this call - stream-ordered reuse keeps them valid
+                    // for the kernel (same pattern as launch_fattn's K_f16)
+                    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8, ncols2>(ctx, dst);
+                    return;
+                }
+                static bool logged_overflow = false;
+                if (!logged_overflow) {
+                    logged_overflow = true;
+                    fprintf(stderr, "%s: union sparse FA overflow (max_union=%d > cap=%d), falling back to per-token\n",
+                            __func__, max_union, cap);
+                }
+            }
+
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, ncols2>(ctx, dst);
             return;
         }
