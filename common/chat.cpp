@@ -1756,20 +1756,21 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
                 }
             }
 
+            // Models emit DSML parameters in arbitrary order, not schema
+            // order (e.g. write -> filePath before content while the schema
+            // declares content first). Accept required and optional params in
+            // any interleaving; argument completeness is the tool's concern.
             common_peg_parser args_seq = p.eps();
-            for (size_t i = 0; i < required_parsers.size(); i++) {
-                if (i > 0) {
-                    args_seq = args_seq + p.space();
+            if (!required_parsers.empty() || !optional_parsers.empty()) {
+                common_peg_parser any_param = p.choice();
+                for (const auto & rp : required_parsers) {
+                    any_param |= rp;
                 }
-                args_seq = args_seq + required_parsers[i];
-            }
-
-            if (!optional_parsers.empty()) {
-                common_peg_parser any_opt = p.choice();
-                for (const auto & opt : optional_parsers) {
-                    any_opt |= opt;
+                for (const auto & op : optional_parsers) {
+                    any_param |= op;
                 }
-                args_seq = args_seq + p.repeat(p.space() + any_opt, 0, -1);
+                common_peg_parser params_any_order = any_param + p.repeat(p.space() + any_param, 0, -1);
+                args_seq = required_parsers.empty() ? p.optional(params_any_order) : params_any_order;
             }
 
             common_peg_parser invoke_body = args_seq;
