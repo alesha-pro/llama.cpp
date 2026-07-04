@@ -1831,7 +1831,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         if constexpr (may_use_top_k) {
             if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_top_k(ctx, dst)) {
                 constexpr bool use_top_k = true;
-                fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_top_k>;
+                // every top_k caller (V3.2 DSA 576, V4 NSA 512) is MLA with V a
+                // view of K - reuse the gathered K tiles for V instead of a
+                // second scalar gather of the same rows
+                fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, true, use_top_k>;
                 FATTN_SET_SHARED_MEMORY_LIMIT(fattn_kernel, id, nbytes_shared_total);
             } else {
                 constexpr bool use_top_k = false;
