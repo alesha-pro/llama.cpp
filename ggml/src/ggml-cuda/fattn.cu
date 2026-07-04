@@ -6,6 +6,49 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
+#include <unordered_set>
+#include <vector>
+
+// DSV4_UNION_STATS=1: diagnostic-only host-side telemetry for the planned
+// query-tiled sparse FA (A2). Copies the per-token top-k index lists to host
+// and reports how large the UNION of adjacent tokens' lists is for candidate
+// tile sizes - the union size decides whether tiling amortizes gather loads.
+static void dsv4_topk_union_stats(ggml_backend_cuda_context & ctx, const ggml_tensor * top_k) {
+    static int call = 0;
+    if (call++ % 50 != 0) {
+        return;
+    }
+    const int64_t n_top_k  = top_k->ne[0];
+    const int64_t n_tokens = top_k->ne[1];
+    std::vector<int32_t> h(n_top_k * n_tokens);
+    CUDA_CHECK(cudaMemcpyAsync(h.data(), top_k->data, ggml_nbytes(top_k), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    fprintf(stderr, "dsv4-union-stats: call=%d n_top_k=%lld n_tokens=%lld", call - 1,
+            (long long) n_top_k, (long long) n_tokens);
+    for (int T : {4, 8, 16}) {
+        int64_t sum = 0, mx = 0, n_tiles = 0;
+        std::unordered_set<int32_t> u;
+        for (int64_t t0 = 0; t0 + T <= n_tokens; t0 += T) {
+            u.clear();
+            for (int64_t t = t0; t < t0 + T; ++t) {
+                for (int64_t i = 0; i < n_top_k; ++i) {
+                    u.insert(h[t*n_top_k + i]);
+                }
+            }
+            const int64_t s = (int64_t) u.size();
+            sum += s;
+            mx   = s > mx ? s : mx;
+            n_tiles++;
+        }
+        if (n_tiles > 0) {
+            fprintf(stderr, " | tile=%d avg=%.0f max=%lld ratio=%.2f", T,
+                    (double) sum / (double) n_tiles, (long long) mx,
+                    ((double) sum / (double) n_tiles) / (double) n_top_k);
+        }
+    }
+    fprintf(stderr, "\n");
+}
+
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED_VARS(ctx);
     const ggml_tensor * Q = dst->src[0];
@@ -37,6 +80,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
                 logged = true;
                 fprintf(stderr, "%s: engaging sparse top-k FA for DKQ=512 (n_top_k=%lld, K=%lld)\n",
                         __func__, (long long) dst->src[5]->ne[0], (long long) dst->src[1]->ne[1]);
+            }
+            static const bool union_stats = getenv("DSV4_UNION_STATS") != nullptr;
+            if (union_stats && dst->src[0]->ne[1] > 1) {
+                dsv4_topk_union_stats(ctx, dst->src[5]);
             }
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, ncols2>(ctx, dst);
             return;
