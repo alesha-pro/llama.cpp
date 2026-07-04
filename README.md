@@ -1,3 +1,47 @@
+# DeepSeek-V4-Flash 284B on 4x RTX 3090, 128-256K context (ds4-longctx)
+
+This branch runs the full DeepSeek-V4-Flash 284B MoE (2-bit expert GGUF, 87 GB) on four RTX 3090s: 96 GB of VRAM total, sm_86, no FP8, PCIe only. It builds on cchuter's V4 CUDA port. Every change sits behind a `DSV4_*` environment variable; with the flags unset the code paths are stock.
+
+Measured on this box (IQ2_XXS/Q2_K experts, Q8_0 attention, imatrix; 220 W per GPU):
+
+| what | number |
+|---|---|
+| prefill at 97K prompt | 436 t/s |
+| full 253K prompt | 18.4 min (ctx 262144) |
+| needle retrieval from 200K depth | pass |
+| decode, short context, MTP on | 37 t/s (34 without MTP) |
+| decode at 200K depth | 12.3 t/s |
+
+## What is in the branch
+
+- Sparse top-k FlashAttention for the CSA prompt chunks (`DSV4_SPARSE_FA`): the FA kernel gathers only the 512 KV positions the lightning indexer selected, with cp.async loads on full tiles and per-Q-tile union lists (`DSV4_FA_UNION`).
+- MoE MMQ tile fix (`DSV4_MOE_TILE`): the ids path sized tiles for the worst-case column bound, which wasted 87% of the MACs at ubatch 512. Sizing from the actual per-expert token count gave +19% end to end. Related finding: IQ2_XXS runs 1.74x faster than Q2_K in MMQ on Ampere.
+- Lightning indexer variants: causal skip (`DSV4_IDX_SKIP`), a q-tiled WMMA kernel for 200K+ depths (`DSV4_IDX_QTILE`).
+- Constant-shape decode graphs (`DSV4_CONSTANT_SHAPE`): depth-bucketed shapes so CUDA graphs replay instead of rebuilding every token.
+- MTP speculative decoding, K=1, end to end: the MTP head is side-loaded from a separate GGUF (`DSV4_MTP_GGUF`), drafts are computed inside the main graph, and llama-server picks them up via `--spec-type dsv4-mtp`. Accept rate is 85-100% on greedy decoding.
+- Tool-call fixes for agent clients: the DSML parser now accepts tool parameters in any order. Before this, a well-formed call failed to parse whenever the model ordered parameters differently from the JSON schema, so clients such as opencode never executed the tool.
+
+## Production launch
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 DSV4_CONSTANT_SHAPE=1 DSV4_SPARSE_FA=1 \
+DSV4_IDX_SKIP=1 DSV4_FA_UNION=1 DSV4_MOE_TILE=1 \
+DSV4_MTP_SPEC=1 DSV4_MTP_GGUF=/path/to/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf \
+./llama-server -m DeepSeek-V4-Flash-IQ2XXS-...-imatrix.gguf \
+  -ngl 999 --split-mode layer --flash-attn on --no-repack \
+  --ctx-size 131072 --batch-size 4096 --ubatch-size 512 \
+  -ts 1,1,1,0.85 --spec-type dsv4-mtp --parallel 1 \
+  --jinja --reasoning on --reasoning-format deepseek --reasoning-budget 2048
+```
+
+Notes: tested only on Ampere (CUDA 12.6). `-ts 1,1,1,0.85` frees room on the last GPU for the MTP weights. Agent clients should send `temperature: 0`; sampling at 0.7 on 2-bit weights measurably degrades tool selection, and greedy decoding also keeps the MTP draft gate open.
+
+I post benchmarks from this rig on X: [@superalesha](https://x.com/superalesha).
+
+---
+
+Original llama.cpp README below.
+
 # llama.cpp
 
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
