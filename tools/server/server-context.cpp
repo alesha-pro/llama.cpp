@@ -2253,7 +2253,7 @@ private:
             if (spec) {
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
 
-                const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL && !dsv4_mtp_spec;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
                 const int n_draft_max = slot.get_n_draft_max();
@@ -2332,7 +2332,7 @@ private:
             }
 
             if (!draft.empty()) {
-                const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL && !dsv4_mtp_spec;
 
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
@@ -3172,7 +3172,7 @@ private:
 
                 // verify and try to accept the draft
                 {
-                    const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                    const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL && !dsv4_mtp_spec;
 
                     // only save the sampler sampler state if we use checkpoints
                     common_sampler_ptr smpl_save;
