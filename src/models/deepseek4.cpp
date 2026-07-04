@@ -1,14 +1,18 @@
 #include "models.h"
 
 #include "ggml-backend.h"
+#include "gguf.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <map>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -1627,6 +1631,132 @@ static ggml_tensor * dsv4_cache_view_3d(ggml_context * ctx, ggml_tensor * cache,
     return ggml_reshape_3d(ctx, view, cache->ne[0], 1, n_rows);
 }
 
+// ---------------------------------------------------------------------------
+// MTP draft module (phase A: offline acceptance testing).
+//
+// The 32 mtp.0.* tensors ship in a SEPARATE gguf (antirez's split); they form
+// one full DS4 layer (window MLA, no NSA) plus e_proj/h_proj input fusion and
+// an hc_head collapse sharing the base model's output.weight. We side-load
+// them outside llama_model_loader into a standalone backend buffer
+// (DSV4_MTP_DEV, default CUDA3 — same device as model.output under layer
+// split, so the whole draft branch stays on one GPU).
+// ---------------------------------------------------------------------------
+
+struct dsv4_mtp_module {
+    bool attempted = false;
+    bool ok        = false;
+    ggml_context         * wctx = nullptr;
+    ggml_backend_buffer_t  wbuf = nullptr;
+    std::map<std::string, ggml_tensor *> tensors;
+
+    ggml_tensor * t(const char * name) const {
+        auto it = tensors.find(name);
+        GGML_ASSERT(it != tensors.end() && "dsv4-mtp: missing tensor");
+        return it->second;
+    }
+};
+
+static dsv4_mtp_module & dsv4_mtp_get() {
+    static dsv4_mtp_module m;
+    if (m.attempted) {
+        return m;
+    }
+    m.attempted = true;
+    const char * path = getenv("DSV4_MTP_GGUF");
+    if (path == nullptr) {
+        return m;
+    }
+
+    ggml_context * meta = nullptr;
+    gguf_init_params ip = { /*no_alloc*/ true, /*ctx*/ &meta };
+    gguf_context * g = gguf_init_from_file(path, ip);
+    if (g == nullptr) {
+        fprintf(stderr, "dsv4-mtp: failed to open %s\n", path);
+        return m;
+    }
+
+    const int64_t n_t = gguf_get_n_tensors(g);
+    ggml_init_params wp = { (size_t)(n_t + 2) * ggml_tensor_overhead(), nullptr, /*no_alloc*/ true };
+    m.wctx = ggml_init(wp);
+
+    std::vector<std::pair<ggml_tensor *, size_t>> pending;
+    for (int64_t i = 0; i < n_t; ++i) {
+        const char  * nm  = gguf_get_tensor_name(g, i);
+        ggml_tensor * src = ggml_get_tensor(meta, nm);
+        ggml_tensor * dst = ggml_dup_tensor(m.wctx, src);
+        ggml_set_name(dst, nm);
+        pending.emplace_back(dst, (size_t)gguf_get_data_offset(g) + gguf_get_tensor_offset(g, i));
+        m.tensors[nm] = dst;
+    }
+
+    const char * devname = getenv("DSV4_MTP_DEV") ? getenv("DSV4_MTP_DEV") : "CUDA3";
+    ggml_backend_dev_t dev = ggml_backend_dev_by_name(devname);
+    ggml_backend_buffer_type_t buft = dev != nullptr
+        ? ggml_backend_dev_buffer_type(dev)
+        : ggml_backend_cpu_buffer_type();
+    m.wbuf = ggml_backend_alloc_ctx_tensors_from_buft(m.wctx, buft);
+    if (m.wbuf == nullptr && buft != ggml_backend_cpu_buffer_type()) {
+        fprintf(stderr, "dsv4-mtp: alloc on %s failed, falling back to CPU\n", devname);
+        m.wbuf = ggml_backend_alloc_ctx_tensors_from_buft(m.wctx, ggml_backend_cpu_buffer_type());
+    }
+    if (m.wbuf == nullptr) {
+        fprintf(stderr, "dsv4-mtp: buffer alloc failed\n");
+        gguf_free(g);
+        ggml_free(meta);
+        return m;
+    }
+    ggml_backend_buffer_set_usage(m.wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    FILE * f = fopen(path, "rb");
+    if (f == nullptr) {
+        fprintf(stderr, "dsv4-mtp: reopen failed for %s\n", path);
+        gguf_free(g);
+        ggml_free(meta);
+        return m;
+    }
+    std::vector<uint8_t> tmp;
+    for (auto & pr : pending) {
+        const size_t nb = ggml_nbytes(pr.first);
+        tmp.resize(nb);
+        if (fseek(f, (long)pr.second, SEEK_SET) != 0 || fread(tmp.data(), 1, nb, f) != nb) {
+            fprintf(stderr, "dsv4-mtp: short read on %s\n", ggml_get_name(pr.first));
+            fclose(f);
+            gguf_free(g);
+            ggml_free(meta);
+            return m;
+        }
+        ggml_backend_tensor_set(pr.first, tmp.data(), 0, nb);
+    }
+    fclose(f);
+    gguf_free(g);
+    ggml_free(meta);
+
+    m.ok = true;
+    fprintf(stderr, "dsv4-mtp: loaded %lld tensors from %s onto %s\n",
+            (long long)n_t, path, dev != nullptr ? devname : "CPU");
+    return m;
+}
+
+// Causal sliding-window mask [n_kv=n_tokens, n_q=n_tokens] over the current
+// ubatch: visible iff 0 <= q_idx - k_idx < window. Built on-device from
+// arange so no CPU fill / no new graph input is needed.
+static ggml_tensor * dsv4_gpu_mask_raw_swa(
+        ggml_context * ctx,
+        int64_t        n_tokens,
+        int64_t        window) {
+    ggml_tensor * ar_k = ggml_arange(ctx, 0.0f, (float) n_tokens - 0.5f, 1.0f);   // [nt]
+    ar_k = dsv4_mul_scalar(ctx, ar_k, -1.0f);
+    ar_k = ggml_repeat_4d(ctx, ggml_reshape_2d(ctx, ar_k, n_tokens, 1), n_tokens, n_tokens, 1, 1);
+    ggml_tensor * ar_q = ggml_arange(ctx, 0.0f, (float) n_tokens - 0.5f, 1.0f);
+    ar_q = ggml_reshape_2d(ctx, ar_q, 1, n_tokens);
+    ggml_tensor * d = ggml_add(ctx, ar_k, ar_q);                                  // d[k,q] = q - k
+    ggml_tensor * vis  = ggml_step(ctx, dsv4_add_scalar(ctx, d, 0.5f));            // q >= k
+    ggml_tensor * vis2 = ggml_step(ctx, dsv4_add_scalar(ctx,
+            dsv4_mul_scalar(ctx, d, -1.0f), (float) window - 0.5f));               // q - k < window
+    vis = ggml_mul(ctx, vis, vis2);
+    return dsv4_mul_scalar(ctx, dsv4_add_scalar(ctx, vis, -1.0f), 1.0e9f);         // 0 / -1e9
+}
+
 } // namespace
 
 llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_params & params) :
@@ -1646,6 +1776,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     ggml_tensor * inp_tokens = res->t_inp_tokens;
     ggml_tensor * inp_pos = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    // Raw token embeddings [n_embd, n_tokens] for the MTP draft branch (e-path).
+    ggml_tensor * mtp_emb0 = inpL;
 
     auto * inp_mem  = build_inp_mem_hybrid_iswa();
     auto * inp_attn = inp_mem->get_attn();
@@ -2308,6 +2441,125 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         inpL = dsv4_hc_post(ctx0, cur, residual, mix.post, mix.comb, n_embd, n_hc, n_tokens);
         cb(inpL, "hc_ffn_post", il);
     }
+
+    // ------------------------------------------------------------------
+    // MTP draft branch (phase A acceptance test, env-gated: DSV4_MTP_TEST +
+    // DSV4_MTP_GGUF). Teacher-forced over the whole ubatch: position j
+    // drafts token j+1 from embed(tok[j]) + the base model's final HC state
+    // of position j-1 (zero seed at j==0, skipped by the scorer). Attention
+    // is causal SWA over the current ubatch only — no MTP KV cache needed.
+    // The offline tool compares argmax(draft[j]) vs argmax(base logits[j]).
+    // ------------------------------------------------------------------
+    if (getenv("DSV4_MTP_TEST") != nullptr && n_tokens > 1) {
+        dsv4_mtp_module & mtp = dsv4_mtp_get();
+        if (mtp.ok) {
+            const int64_t nt = n_tokens;
+            // h-path: previous-position HC, shifted right by one column
+            ggml_tensor * hc_prev = ggml_view_3d(ctx0, inpL, n_embd, n_hc, nt - 1,
+                    inpL->nb[1], inpL->nb[2], 0);
+            ggml_tensor * hc_seed = ggml_fill(ctx0,
+                    ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, n_hc, 1), 0.0f);
+            hc_prev = ggml_concat(ctx0, hc_seed, hc_prev, 2);                 // [n_embd, n_hc, nt]
+            ggml_tensor * hpath = ggml_rms_norm(ctx0, hc_prev, norm_rms_eps);
+            hpath = ggml_mul(ctx0, hpath, mtp.t("mtp.0.hnorm.weight"));
+            hpath = ggml_mul_mat(ctx0, mtp.t("mtp.0.h_proj.weight"), hpath);  // [n_embd, n_hc, nt]
+            // e-path: current-token embedding
+            ggml_tensor * epath = build_norm(mtp_emb0, mtp.t("mtp.0.enorm.weight"), nullptr, LLM_NORM_RMS, -1);
+            epath = ggml_mul_mat(ctx0, mtp.t("mtp.0.e_proj.weight"), epath);  // [n_embd, nt]
+            epath = ggml_reshape_3d(ctx0, epath, n_embd, 1, nt);
+            ggml_tensor * mtp_hc = ggml_add(ctx0, hpath, epath);              // bcast over n_hc
+            cb(mtp_hc, "mtp_input_hc", -1);
+
+            const dsv4_rope_cfg mtp_rope = dsv4_make_rope_cfg(hparams, cparams, 0);
+
+            // attention (window MLA, same shape as a compress_ratio==0 layer)
+            ggml_tensor * mtp_res = mtp_hc;
+            dsv4_hc_mix mtp_mix = dsv4_hc_pre(ctx0, mtp_hc,
+                    mtp.t("mtp.0.hc_attn_fn.weight"), mtp.t("mtp.0.hc_attn_scale.weight"),
+                    mtp.t("mtp.0.hc_attn_base.weight"),
+                    n_embd, n_hc, nt, norm_rms_eps, hparams.hc_sinkhorn_iters, hparams.hc_eps);
+            ggml_tensor * mcur = build_norm(mtp_mix.x, mtp.t("mtp.0.attn_norm.weight"), nullptr, LLM_NORM_RMS, -1);
+            ggml_tensor * mqr = ggml_mul_mat(ctx0, mtp.t("mtp.0.attn_q_a.weight"), mcur);
+            mqr = build_norm(mqr, mtp.t("mtp.0.attn_q_a_norm.weight"), nullptr, LLM_NORM_RMS, -1);
+            ggml_tensor * mq = ggml_mul_mat(ctx0, mtp.t("mtp.0.attn_q_b.weight"), mqr);
+            mq = ggml_reshape_3d(ctx0, mq, n_embd_head_k, n_head, nt);
+            mq = ggml_rms_norm(ctx0, mq, norm_rms_eps);
+            mq = dsv4_apply_rope_tail(ctx0, mq, inp_pos,
+                    n_embd_head_k, n_head, nt, n_rot, rope_type,
+                    mtp_rope.n_ctx_orig, mtp_rope.freq_base, mtp_rope.freq_scale,
+                    mtp_rope.ext_factor, mtp_rope.attn_factor, mtp_rope.beta_fast, mtp_rope.beta_slow, false);
+            ggml_tensor * mkv = ggml_mul_mat(ctx0, mtp.t("mtp.0.attn_kv.weight"), mcur);
+            mkv = build_norm(mkv, mtp.t("mtp.0.attn_kv_a_norm.weight"), nullptr, LLM_NORM_RMS, -1);
+            mkv = ggml_reshape_3d(ctx0, mkv, n_embd_head_k, 1, nt);
+            mkv = dsv4_apply_rope_tail(ctx0, mkv, inp_pos,
+                    n_embd_head_k, 1, nt, n_rot, rope_type,
+                    mtp_rope.n_ctx_orig, mtp_rope.freq_base, mtp_rope.freq_scale,
+                    mtp_rope.ext_factor, mtp_rope.attn_factor, mtp_rope.beta_fast, mtp_rope.beta_slow, false);
+            mkv = ggml_dsv4_fp8_kv_quantize(ctx0, mkv, n_rot);
+
+            ggml_tensor * mk = mkv;
+            ggml_tensor * mv = mkv;
+            const int64_t mtp_window = hparams.n_swa > 0 ? (int64_t) hparams.n_swa : 128;
+            ggml_tensor * mmask = dsv4_gpu_mask_raw_swa(ctx0, nt, mtp_window);
+            if (cparams.flash_attn) {
+                dsv4_pad_fattn_width(ctx0, &mk, &mmask);
+                mv = mk;
+            }
+            ggml_tensor * mmask_cnv = cparams.flash_attn ? ggml_cast(ctx0, mmask, GGML_TYPE_F16) : mmask;
+            mcur = build_attn_mha(mq, mk, mv, nullptr, mmask_cnv,
+                    mtp.t("mtp.0.attn_sinks.weight"), nullptr, nullptr, kq_scale, n_layer - 1);
+            cb(mcur, "mtp_kqv_out", -1);
+            mcur = ggml_reshape_3d(ctx0, mcur, n_embd_head_v, n_head, nt);
+            mcur = dsv4_apply_rope_tail(ctx0, mcur, inp_pos,
+                    n_embd_head_v, n_head, nt, n_rot, rope_type,
+                    mtp_rope.n_ctx_orig, mtp_rope.freq_base, mtp_rope.freq_scale,
+                    mtp_rope.ext_factor, mtp_rope.attn_factor, mtp_rope.beta_fast, mtp_rope.beta_slow, true);
+            mcur = dsv4_grouped_out(ctx0, mcur,
+                    mtp.t("mtp.0.attn_output_a.weight"), mtp.t("mtp.0.attn_output_b.weight"),
+                    n_embd_head_v, n_head, n_out_group, n_lora_o, nt);
+            mtp_hc = dsv4_hc_post(ctx0, mcur, mtp_res, mtp_mix.post, mtp_mix.comb, n_embd, n_hc, nt);
+
+            // FFN (MoE-256 + shared, same gating as the base layers)
+            mtp_res = mtp_hc;
+            mtp_mix = dsv4_hc_pre(ctx0, mtp_hc,
+                    mtp.t("mtp.0.hc_ffn_fn.weight"), mtp.t("mtp.0.hc_ffn_scale.weight"),
+                    mtp.t("mtp.0.hc_ffn_base.weight"),
+                    n_embd, n_hc, nt, norm_rms_eps, hparams.hc_sinkhorn_iters, hparams.hc_eps);
+            mcur = build_norm(mtp_mix.x, mtp.t("mtp.0.ffn_norm.weight"), nullptr, LLM_NORM_RMS, -1);
+            ggml_tensor * mmoe = build_moe_ffn(mcur,
+                    mtp.t("mtp.0.ffn_gate_inp.weight"),
+                    mtp.t("mtp.0.ffn_up_exps.weight"),
+                    mtp.t("mtp.0.ffn_gate_exps.weight"),
+                    mtp.t("mtp.0.ffn_down_exps.weight"),
+                    mtp.t("mtp.0.exp_probs_b.bias"),
+                    n_expert, n_expert_used,
+                    LLM_FFN_SILU, hparams.expert_weights_norm,
+                    hparams.expert_weights_scale,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    n_layer - 1,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+            ggml_tensor * mshexp = build_ffn(mcur,
+                    mtp.t("mtp.0.ffn_up_shexp.weight"),   nullptr, nullptr,
+                    mtp.t("mtp.0.ffn_gate_shexp.weight"), nullptr, nullptr,
+                    mtp.t("mtp.0.ffn_down_shexp.weight"), nullptr, nullptr,
+                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, n_layer - 1);
+            mcur = ggml_add(ctx0, mmoe, mshexp);
+            mtp_hc = dsv4_hc_post(ctx0, mcur, mtp_res, mtp_mix.post, mtp_mix.comb, n_embd, n_hc, nt);
+
+            // head: hc collapse + final norm + shared output.weight -> argmax
+            mcur = dsv4_hc_head(ctx0, mtp_hc,
+                    mtp.t("mtp.0.hc_head_fn.weight"), mtp.t("mtp.0.hc_head_scale.weight"),
+                    mtp.t("mtp.0.hc_head_base.weight"),
+                    n_embd, n_hc, nt, norm_rms_eps, hparams.hc_eps);
+            mcur = build_norm(mcur, mtp.t("mtp.0.norm.weight"), nullptr, LLM_NORM_RMS, -1);
+            mcur = ggml_mul_mat(ctx0, model.output, mcur);                    // [n_vocab, nt]
+            ggml_tensor * mtp_draft = ggml_argmax(ctx0, mcur);                // i32 [nt]
+            ggml_set_name(mtp_draft, "mtp_draft_tok");
+            ggml_set_output(mtp_draft);
+            ggml_build_forward_expand(gf, mtp_draft);
+        }
+    }
+
     if (inp_out_ids) {
         inpL = ggml_reshape_2d(ctx0, inpL, n_embd * n_hc, n_tokens);
         inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
