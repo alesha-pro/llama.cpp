@@ -281,6 +281,11 @@ static bool dsv4_gpu_masks_disabled() {
 
 // (dsv4_gpu_mask_comp_causal is defined below, after the scalar helpers.)
 
+struct dsv4_mtp_module;
+static dsv4_mtp_module & dsv4_mtp_get();
+static int64_t dsv4_mtp_ring_pos_at(int64_t r);
+static const float * dsv4_mtp_seed_data(size_t need);
+
 class dsv4_graph_inputs : public llm_graph_input_i {
 public:
     ggml_tensor * add_mask(
@@ -374,6 +379,51 @@ public:
         return add_scalar_input(ctx, ratio, 0, dsv4_idx_mode::BOUNDARY_FLAG, GGML_TYPE_F32, name);
     }
 
+    // --- MTP speculative-decode inputs (phase B) ------------------------
+    // seed: HC state of the token preceding the batch (client-owned CPU copy).
+    ggml_tensor * add_mtp_seed(ggml_context * ctx, int64_t n_embd, int64_t n_hc) {
+        if (mtp_seed == nullptr) {
+            mtp_seed = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_hc);
+            ggml_set_input(mtp_seed);
+            ggml_set_name(mtp_seed, "mtp_seed_in");
+        }
+        return mtp_seed;
+    }
+    // ring write rows: pos % ring per batch token.
+    ggml_tensor * add_mtp_ring_rows(ggml_context * ctx, int64_t n_tokens, int64_t ring) {
+        if (mtp_ring_rows == nullptr) {
+            mtp_ring_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+            ggml_set_input(mtp_ring_rows);
+            ggml_set_name(mtp_ring_rows, "mtp_ring_rows");
+            mtp_ring = ring;
+        }
+        return mtp_ring_rows;
+    }
+    // RoPE positions of the draft candidates: pos[nt-n_cand+j] + 1.
+    ggml_tensor * add_mtp_cand_pos(ggml_context * ctx, int64_t n_cand) {
+        if (mtp_cand_pos == nullptr) {
+            mtp_cand_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_cand);
+            ggml_set_input(mtp_cand_pos);
+            ggml_set_name(mtp_cand_pos, "mtp_cand_pos");
+            mtp_n_cand = n_cand;
+        }
+        return mtp_cand_pos;
+    }
+    // Candidate attention mask over [ring | batch-local KV | own KV] x n_cand.
+    // Strict "<" against ring/local positions: a rejected draft's KV shares its
+    // position with the reject-candidate's query and must stay invisible.
+    ggml_tensor * add_mtp_mask(ggml_context * ctx, int64_t ring, int64_t n_tokens,
+                               int64_t n_cand, int64_t window) {
+        if (mtp_mask == nullptr) {
+            mtp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ring + n_tokens + n_cand, n_cand);
+            ggml_set_input(mtp_mask);
+            ggml_set_name(mtp_mask, "mtp_mask");
+            mtp_window = window;
+            mtp_ring   = ring;
+        }
+        return mtp_mask;
+    }
+
     void set_input(const llama_ubatch * ubatch) override {
         const llama_pos last_pos = (ubatch && ubatch->pos && ubatch->n_tokens > 0)
             ? ubatch->pos[ubatch->n_tokens - 1] : 0;
@@ -438,6 +488,61 @@ public:
 
             ggml_backend_tensor_set(mask.tensor, data.data(), 0, data.size()*sizeof(float));
         }
+
+        // --- MTP speculative inputs (phase B) ---
+        if (mtp_seed != nullptr && mtp_seed->buffer != nullptr) {
+            const size_t n = (size_t) mtp_seed->ne[0] * mtp_seed->ne[1];
+            ggml_backend_tensor_set(mtp_seed, dsv4_mtp_seed_data(n), 0, n * sizeof(float));
+        }
+        if (mtp_ring_rows != nullptr && mtp_ring_rows->buffer != nullptr && ubatch != nullptr) {
+            const int64_t nt = mtp_ring_rows->ne[0];
+            std::vector<int32_t> rows((size_t) nt, 0);
+            for (int64_t i = 0; i < nt; ++i) {
+                const llama_pos p = (ubatch->pos && i < (int64_t) ubatch->n_tokens)
+                    ? ubatch->pos[i] : (llama_pos) i;
+                rows[i] = (int32_t)(p % mtp_ring);
+            }
+            ggml_backend_tensor_set(mtp_ring_rows, rows.data(), 0, rows.size()*sizeof(int32_t));
+        }
+        if (mtp_cand_pos != nullptr && mtp_cand_pos->buffer != nullptr && ubatch != nullptr) {
+            const int64_t nt = (int64_t) ubatch->n_tokens;
+            std::vector<int32_t> cp((size_t) mtp_n_cand, 0);
+            for (int64_t c = 0; c < mtp_n_cand; ++c) {
+                const int64_t j = std::max<int64_t>(0, nt - mtp_n_cand + c);
+                const llama_pos p = ubatch->pos ? ubatch->pos[j] : (llama_pos) j;
+                cp[c] = (int32_t)(p + 1);
+            }
+            ggml_backend_tensor_set(mtp_cand_pos, cp.data(), 0, cp.size()*sizeof(int32_t));
+        }
+        if (mtp_mask != nullptr && mtp_mask->buffer != nullptr && ubatch != nullptr) {
+            const int64_t nt   = (int64_t) ubatch->n_tokens;
+            const int64_t ring = mtp_ring;
+            const int64_t n0   = mtp_mask->ne[0];   // ring + nt + n_cand
+            const int64_t nc   = mtp_mask->ne[1];
+            std::vector<float> data((size_t)(n0*nc), -INFINITY);
+            for (int64_t c = 0; c < nc; ++c) {
+                const int64_t j = std::max<int64_t>(0, nt - nc + c);
+                const llama_pos q = (ubatch->pos ? ubatch->pos[j] : (llama_pos) j) + 1;
+                // ring rows: strict '<' (a rejected draft's stale KV shares q's
+                // position and must stay invisible), window-limited, empty = -inf
+                for (int64_t r = 0; r < ring; ++r) {
+                    const int64_t rp = dsv4_mtp_ring_pos_at(r);
+                    if (rp >= 0 && rp < q && q - rp < mtp_window) {
+                        data[(size_t)(c*n0 + r)] = 0.0f;
+                    }
+                }
+                // batch-local KV: strict '<'
+                for (int64_t i = 0; i < nt; ++i) {
+                    const llama_pos p = ubatch->pos ? ubatch->pos[i] : (llama_pos) i;
+                    if (p < q && q - p < mtp_window) {
+                        data[(size_t)(c*n0 + ring + i)] = 0.0f;
+                    }
+                }
+                // own KV: diagonal only
+                data[(size_t)(c*n0 + ring + nt + c)] = 0.0f;
+            }
+            ggml_backend_tensor_set(mtp_mask, data.data(), 0, data.size()*sizeof(float));
+        }
     }
 
     // Graph reuse: the mask tensors have FIXED shapes baked at build time and
@@ -452,6 +557,15 @@ public:
         const auto & ub = params.ubatch;
         const int64_t nt = ub.n_tokens;
         const llama_pos last_pos = ub.pos ? ub.pos[nt - 1] : (llama_pos)(nt - 1);
+        // MTP spec inputs: shapes depend on nt and n_cand=min(nt,2).
+        if (mtp_ring_rows != nullptr && mtp_ring_rows->ne[0] != nt) {
+            return false;
+        }
+        if (mtp_mask != nullptr &&
+            (mtp_mask->ne[1] != std::min<int64_t>(nt, 2) ||
+             mtp_mask->ne[0] != mtp_ring + nt + mtp_mask->ne[1])) {
+            return false;
+        }
         // The comp branch must appear the moment n_comp_visible crosses 0 for
         // any ratio -> force a rebuild (see note_comp_presence).
         for (const auto & e : presence) {
@@ -562,6 +676,15 @@ private:
     std::vector<dsv4_index_entry> indices;
     std::vector<dsv4_presence_entry> presence;
     std::vector<dsv4_width_entry> widths;
+
+    // MTP speculative-decode inputs (phase B)
+    ggml_tensor * mtp_seed      = nullptr;
+    ggml_tensor * mtp_ring_rows = nullptr;
+    ggml_tensor * mtp_cand_pos  = nullptr;
+    ggml_tensor * mtp_mask      = nullptr;
+    int64_t mtp_ring   = 0;
+    int64_t mtp_n_cand = 0;
+    int64_t mtp_window = 0;
 };
 
 struct dsv4_rope_cfg {
@@ -1642,17 +1765,57 @@ static ggml_tensor * dsv4_cache_view_3d(ggml_context * ctx, ggml_tensor * cache,
 // split, so the whole draft branch stays on one GPU).
 // ---------------------------------------------------------------------------
 
+// Speculative-decode ring size: matches the MTP layer's training-time SWA
+// window. Ring rows hold the fp8-quantized MTP-layer KV of the last 128
+// accepted (or teacher-forced) positions; ring_pos_cpu[r] is the absolute
+// position stored in row r (-1 = empty). The CLIENT owns ring_pos_cpu updates
+// (dsv4_mtp_spec_commit) so graph warmup/reserve runs never corrupt it.
+static constexpr int64_t DSV4_MTP_RING = 128;
+
 struct dsv4_mtp_module {
     bool attempted = false;
     bool ok        = false;
     ggml_context         * wctx = nullptr;
     ggml_backend_buffer_t  wbuf = nullptr;
+    ggml_backend_buffer_type_t wbuft = nullptr;
     std::map<std::string, ggml_tensor *> tensors;
+
+    // phase-B speculative state
+    ggml_context         * rctx = nullptr;   // ring tensor ctx
+    ggml_backend_buffer_t  rbuf = nullptr;
+    ggml_tensor          * ring_kv = nullptr; // [kv_w, DSV4_MTP_RING], fp8-kv type
+    int64_t   ring_pos_cpu[DSV4_MTP_RING];    // abs position per row, -1 empty
+    std::vector<float> hc_seed_cpu;           // [n_embd*n_hc] HC of the token before the batch
 
     ggml_tensor * t(const char * name) const {
         auto it = tensors.find(name);
         GGML_ASSERT(it != tensors.end() && "dsv4-mtp: missing tensor");
         return it->second;
+    }
+
+    // Lazily create the ring buffer once the kv row layout is known (first
+    // spec-branch build). Zero-filled: unwritten rows are masked out by
+    // ring_pos_cpu < 0, but FA still multiplies masked K rows by Q before the
+    // -inf mask lands, and uninitialized memory could be NaN (0*NaN = NaN).
+    bool ensure_ring(ggml_type kv_type, int64_t kv_w) {
+        if (ring_kv != nullptr) {
+            return true;
+        }
+        ggml_init_params rp = { 2 * ggml_tensor_overhead(), nullptr, /*no_alloc*/ true };
+        rctx = ggml_init(rp);
+        ring_kv = ggml_new_tensor_2d(rctx, kv_type, kv_w, DSV4_MTP_RING);
+        ggml_set_name(ring_kv, "dsv4_mtp_ring_kv");
+        rbuf = ggml_backend_alloc_ctx_tensors_from_buft(rctx, wbuft);
+        if (rbuf == nullptr) {
+            fprintf(stderr, "dsv4-mtp: ring alloc failed\n");
+            ring_kv = nullptr;
+            return false;
+        }
+        ggml_backend_buffer_clear(rbuf, 0);
+        for (int64_t i = 0; i < DSV4_MTP_RING; ++i) {
+            ring_pos_cpu[i] = -1;
+        }
+        return true;
     }
 };
 
@@ -1694,6 +1857,7 @@ static dsv4_mtp_module & dsv4_mtp_get() {
     ggml_backend_buffer_type_t buft = dev != nullptr
         ? ggml_backend_dev_buffer_type(dev)
         : ggml_backend_cpu_buffer_type();
+    m.wbuft = buft;
     m.wbuf = ggml_backend_alloc_ctx_tensors_from_buft(m.wctx, buft);
     if (m.wbuf == nullptr && buft != ggml_backend_cpu_buffer_type()) {
         fprintf(stderr, "dsv4-mtp: alloc on %s failed, falling back to CPU\n", devname);
@@ -1735,6 +1899,22 @@ static dsv4_mtp_module & dsv4_mtp_get() {
     fprintf(stderr, "dsv4-mtp: loaded %lld tensors from %s onto %s\n",
             (long long)n_t, path, dev != nullptr ? devname : "CPU");
     return m;
+}
+
+static int64_t dsv4_mtp_ring_pos_at(int64_t r) {
+    dsv4_mtp_module & m = dsv4_mtp_get();
+    if (m.ring_kv == nullptr || r < 0 || r >= DSV4_MTP_RING) {
+        return -1;
+    }
+    return m.ring_pos_cpu[r];
+}
+
+static const float * dsv4_mtp_seed_data(size_t need) {
+    dsv4_mtp_module & m = dsv4_mtp_get();
+    if (m.hc_seed_cpu.size() < need) {
+        m.hc_seed_cpu.resize(need, 0.0f);
+    }
+    return m.hc_seed_cpu.data();
 }
 
 // Causal sliding-window mask [n_kv=n_tokens, n_q=n_tokens] over the current
@@ -2560,10 +2740,78 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         }
     }
 
+    // ------------------------------------------------------------------
+    // MTP speculative decode (phase B, env-gated: DSV4_MTP_SPEC).
+    // Ingest half: compute the MTP-layer KV of EVERY batch token (teacher-
+    // forced, seed HC comes from the client via the mtp_seed_in input) and
+    // store it into the persistent 128-row ring on the MTP device. No
+    // attention here — the ring is read by the candidate half below.
+    // ------------------------------------------------------------------
+    ggml_tensor * mtp_spec_kv_local  = nullptr; // this batch's fp8 KV [w,1,nt]
+    ggml_tensor * mtp_spec_ring_read = nullptr; // ring view ordered after write
+    const bool mtp_spec = getenv("DSV4_MTP_SPEC") != nullptr && dsv4_mtp_get().ok
+        && inp_tokens != nullptr;
+    if (mtp_spec) {
+        dsv4_mtp_module & mtp = dsv4_mtp_get();
+        auto * di = get_dsv4_inputs();
+        const int64_t nt = n_tokens;
+        ggml_tensor * seed  = di->add_mtp_seed(ctx0, n_embd, n_hc);
+        ggml_tensor * seed3 = ggml_reshape_3d(ctx0, seed, n_embd, n_hc, 1);
+        ggml_tensor * hc_prev = seed3;
+        if (nt > 1) {
+            ggml_tensor * hshift = ggml_view_3d(ctx0, inpL, n_embd, n_hc, nt - 1,
+                    inpL->nb[1], inpL->nb[2], 0);
+            hc_prev = ggml_concat(ctx0, seed3, hshift, 2);
+        }
+        ggml_tensor * h = ggml_rms_norm(ctx0, hc_prev, norm_rms_eps);
+        h = ggml_mul(ctx0, h, mtp.t("mtp.0.hnorm.weight"));
+        h = ggml_mul_mat(ctx0, mtp.t("mtp.0.h_proj.weight"), h);
+        ggml_tensor * e = build_norm(mtp_emb0, mtp.t("mtp.0.enorm.weight"), nullptr, LLM_NORM_RMS, -1);
+        e = ggml_mul_mat(ctx0, mtp.t("mtp.0.e_proj.weight"), e);
+        e = ggml_reshape_3d(ctx0, e, n_embd, 1, nt);
+        ggml_tensor * ihc = ggml_add(ctx0, h, e);
+        dsv4_hc_mix mix_i = dsv4_hc_pre(ctx0, ihc,
+                mtp.t("mtp.0.hc_attn_fn.weight"), mtp.t("mtp.0.hc_attn_scale.weight"),
+                mtp.t("mtp.0.hc_attn_base.weight"),
+                n_embd, n_hc, nt, norm_rms_eps, hparams.hc_sinkhorn_iters, hparams.hc_eps);
+        ggml_tensor * icur = build_norm(mix_i.x, mtp.t("mtp.0.attn_norm.weight"), nullptr, LLM_NORM_RMS, -1);
+        ggml_tensor * ikv = ggml_mul_mat(ctx0, mtp.t("mtp.0.attn_kv.weight"), icur);
+        ikv = build_norm(ikv, mtp.t("mtp.0.attn_kv_a_norm.weight"), nullptr, LLM_NORM_RMS, -1);
+        ikv = ggml_reshape_3d(ctx0, ikv, n_embd_head_k, 1, nt);
+        const dsv4_rope_cfg spec_rope = dsv4_make_rope_cfg(hparams, cparams, 0);
+        ikv = dsv4_apply_rope_tail(ctx0, ikv, inp_pos,
+                n_embd_head_k, 1, nt, n_rot, rope_type,
+                spec_rope.n_ctx_orig, spec_rope.freq_base, spec_rope.freq_scale,
+                spec_rope.ext_factor, spec_rope.attn_factor, spec_rope.beta_fast, spec_rope.beta_slow, false);
+        ikv = ggml_dsv4_fp8_kv_quantize(ctx0, ikv, n_rot);
+        mtp_spec_kv_local = ikv;
+        if (mtp.ensure_ring(ikv->type, ikv->ne[0])) {
+            ggml_tensor * rows = di->add_mtp_ring_rows(ctx0, nt, DSV4_MTP_RING);
+            ggml_tensor * kv2d = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ikv), ikv->ne[0], nt);
+            ggml_tensor * updated = ggml_set_rows(ctx0, mtp.ring_kv, kv2d, rows);
+            ggml_build_forward_expand(gf, updated);
+            mtp_spec_ring_read = updated;
+        }
+    }
+
     if (inp_out_ids) {
         inpL = ggml_reshape_2d(ctx0, inpL, n_embd * n_hc, n_tokens);
         inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         inpL = ggml_reshape_3d(ctx0, inpL, n_embd, n_hc, n_outputs);
+    }
+
+    // MTP spec: expose the final HC of the last <=2 output positions. The
+    // client reads this via cb_eval and feeds the right column back as the
+    // next batch's mtp_seed_in (picking column 0 after a draft reject).
+    if (mtp_spec && (inp_out_ids ? n_outputs : n_tokens) >= 1) {
+        const int64_t n_out_hc = inp_out_ids ? n_outputs : n_tokens;
+        const int64_t nh = std::min<int64_t>(n_out_hc, 2);
+        ggml_tensor * hist = ggml_view_3d(ctx0, inpL, n_embd, n_hc, nh,
+                inpL->nb[1], inpL->nb[2], (n_out_hc - nh) * inpL->nb[2]);
+        hist = ggml_cont(ctx0, hist);
+        ggml_set_name(hist, "mtp_hc_hist");
+        ggml_set_output(hist);
+        ggml_build_forward_expand(gf, hist);
     }
 
     ggml_tensor * cur = dsv4_hc_head(ctx0, inpL,
@@ -2580,4 +2828,183 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     cb(cur, "result_output", -1);
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
+
+    // ------------------------------------------------------------------
+    // MTP speculative decode (phase B), candidate half: draft BOTH verify
+    // outcomes ahead of time. Candidate c extends output position
+    // n_out-nc+c with token argmax(base logits at that position); its draft
+    // is what the client uses next cycle (c=0 if the draft was rejected,
+    // c=1 if accepted). Attention = [ring | batch-local KV | own KV] with
+    // the client-consistent mtp_mask input; strict '<' keeps a rejected
+    // position's stale KV invisible to the reject candidate.
+    // ------------------------------------------------------------------
+    if (mtp_spec && mtp_spec_ring_read != nullptr &&
+        (inp_out_ids ? n_outputs : n_tokens) >= 1) {
+        dsv4_mtp_module & mtp = dsv4_mtp_get();
+        auto * di = get_dsv4_inputs();
+        const int64_t nt    = n_tokens;
+        const int64_t n_out = inp_out_ids ? n_outputs : n_tokens;
+        const int64_t nc    = std::min<int64_t>(n_out, 2);
+        const int64_t spec_window = hparams.n_swa > 0 ? (int64_t) hparams.n_swa : 128;
+
+        ggml_tensor * lg_tail = ggml_view_2d(ctx0, cur, cur->ne[0], nc,
+                cur->nb[1], (n_out - nc) * cur->nb[1]);
+        ggml_tensor * cand_tok = ggml_argmax(ctx0, lg_tail);                    // i32 [nc]
+        ggml_tensor * cand_emb = ggml_get_rows(ctx0, model.tok_embd, cand_tok); // [n_embd, nc]
+
+        ggml_tensor * hc_tail = ggml_view_3d(ctx0, inpL, n_embd, n_hc, nc,
+                inpL->nb[1], inpL->nb[2], (n_out - nc) * inpL->nb[2]);
+        ggml_tensor * h = ggml_rms_norm(ctx0, hc_tail, norm_rms_eps);
+        h = ggml_mul(ctx0, h, mtp.t("mtp.0.hnorm.weight"));
+        h = ggml_mul_mat(ctx0, mtp.t("mtp.0.h_proj.weight"), h);
+        ggml_tensor * e = build_norm(cand_emb, mtp.t("mtp.0.enorm.weight"), nullptr, LLM_NORM_RMS, -1);
+        e = ggml_mul_mat(ctx0, mtp.t("mtp.0.e_proj.weight"), e);
+        e = ggml_reshape_3d(ctx0, e, n_embd, 1, nc);
+        ggml_tensor * chc = ggml_add(ctx0, h, e);                               // [n_embd, n_hc, nc]
+
+        const dsv4_rope_cfg spec_rope = dsv4_make_rope_cfg(hparams, cparams, 0);
+        ggml_tensor * cpos = di->add_mtp_cand_pos(ctx0, nc);
+
+        ggml_tensor * cres = chc;
+        dsv4_hc_mix cmix = dsv4_hc_pre(ctx0, chc,
+                mtp.t("mtp.0.hc_attn_fn.weight"), mtp.t("mtp.0.hc_attn_scale.weight"),
+                mtp.t("mtp.0.hc_attn_base.weight"),
+                n_embd, n_hc, nc, norm_rms_eps, hparams.hc_sinkhorn_iters, hparams.hc_eps);
+        ggml_tensor * ccur = build_norm(cmix.x, mtp.t("mtp.0.attn_norm.weight"), nullptr, LLM_NORM_RMS, -1);
+        ggml_tensor * cqr = ggml_mul_mat(ctx0, mtp.t("mtp.0.attn_q_a.weight"), ccur);
+        cqr = build_norm(cqr, mtp.t("mtp.0.attn_q_a_norm.weight"), nullptr, LLM_NORM_RMS, -1);
+        ggml_tensor * cq = ggml_mul_mat(ctx0, mtp.t("mtp.0.attn_q_b.weight"), cqr);
+        cq = ggml_reshape_3d(ctx0, cq, n_embd_head_k, n_head, nc);
+        cq = ggml_rms_norm(ctx0, cq, norm_rms_eps);
+        cq = dsv4_apply_rope_tail(ctx0, cq, cpos,
+                n_embd_head_k, n_head, nc, n_rot, rope_type,
+                spec_rope.n_ctx_orig, spec_rope.freq_base, spec_rope.freq_scale,
+                spec_rope.ext_factor, spec_rope.attn_factor, spec_rope.beta_fast, spec_rope.beta_slow, false);
+        ggml_tensor * ckv = ggml_mul_mat(ctx0, mtp.t("mtp.0.attn_kv.weight"), ccur);
+        ckv = build_norm(ckv, mtp.t("mtp.0.attn_kv_a_norm.weight"), nullptr, LLM_NORM_RMS, -1);
+        ckv = ggml_reshape_3d(ctx0, ckv, n_embd_head_k, 1, nc);
+        ckv = dsv4_apply_rope_tail(ctx0, ckv, cpos,
+                n_embd_head_k, 1, nc, n_rot, rope_type,
+                spec_rope.n_ctx_orig, spec_rope.freq_base, spec_rope.freq_scale,
+                spec_rope.ext_factor, spec_rope.attn_factor, spec_rope.beta_fast, spec_rope.beta_slow, false);
+        ckv = ggml_dsv4_fp8_kv_quantize(ctx0, ckv, n_rot);
+
+        ggml_tensor * ring3 = ggml_reshape_3d(ctx0, mtp_spec_ring_read,
+                mtp.ring_kv->ne[0], 1, DSV4_MTP_RING);
+        ggml_tensor * k_all = ggml_concat(ctx0, ring3, mtp_spec_kv_local, 2);
+        k_all = ggml_concat(ctx0, k_all, ckv, 2);
+        ggml_tensor * cmask = di->add_mtp_mask(ctx0, DSV4_MTP_RING, nt, nc, spec_window);
+        // FA width padding to a 256 multiple — but ggml_fill may not support
+        // the fp8 KV type, so pad by duplicating leading ring rows (valid bit
+        // patterns) under an all--inf mask extension instead.
+        if (cparams.flash_attn) {
+            const int64_t wid = DSV4_MTP_RING + nt + nc;
+            const int64_t pad = GGML_PAD(wid, 256) - wid;
+            if (pad > 0) {
+                // pad < 256 <= wid always, so the leading rows of k_all itself
+                // are enough (valid fp8 bit patterns, masked to -inf below)
+                ggml_tensor * padk = ggml_view_3d(ctx0, k_all,
+                        k_all->ne[0], 1, pad, k_all->nb[1], k_all->nb[2], 0);
+                k_all = ggml_concat(ctx0, k_all, padk, 2);
+                ggml_tensor * padm = dsv4_new_filled_2d(ctx0, pad, nc, -INFINITY);
+                cmask = ggml_concat(ctx0, cmask, padm, 0);
+            }
+        }
+        ggml_tensor * cmask_cnv = cparams.flash_attn ? ggml_cast(ctx0, cmask, GGML_TYPE_F16) : cmask;
+        ccur = build_attn_mha(cq, k_all, k_all, nullptr, cmask_cnv,
+                mtp.t("mtp.0.attn_sinks.weight"), nullptr, nullptr, kq_scale, n_layer - 1);
+        ccur = ggml_reshape_3d(ctx0, ccur, n_embd_head_v, n_head, nc);
+        ccur = dsv4_apply_rope_tail(ctx0, ccur, cpos,
+                n_embd_head_v, n_head, nc, n_rot, rope_type,
+                spec_rope.n_ctx_orig, spec_rope.freq_base, spec_rope.freq_scale,
+                spec_rope.ext_factor, spec_rope.attn_factor, spec_rope.beta_fast, spec_rope.beta_slow, true);
+        ccur = dsv4_grouped_out(ctx0, ccur,
+                mtp.t("mtp.0.attn_output_a.weight"), mtp.t("mtp.0.attn_output_b.weight"),
+                n_embd_head_v, n_head, n_out_group, n_lora_o, nc);
+        chc = dsv4_hc_post(ctx0, ccur, cres, cmix.post, cmix.comb, n_embd, n_hc, nc);
+
+        cres = chc;
+        cmix = dsv4_hc_pre(ctx0, chc,
+                mtp.t("mtp.0.hc_ffn_fn.weight"), mtp.t("mtp.0.hc_ffn_scale.weight"),
+                mtp.t("mtp.0.hc_ffn_base.weight"),
+                n_embd, n_hc, nc, norm_rms_eps, hparams.hc_sinkhorn_iters, hparams.hc_eps);
+        ccur = build_norm(cmix.x, mtp.t("mtp.0.ffn_norm.weight"), nullptr, LLM_NORM_RMS, -1);
+        ggml_tensor * cmoe = build_moe_ffn(ccur,
+                mtp.t("mtp.0.ffn_gate_inp.weight"),
+                mtp.t("mtp.0.ffn_up_exps.weight"),
+                mtp.t("mtp.0.ffn_gate_exps.weight"),
+                mtp.t("mtp.0.ffn_down_exps.weight"),
+                mtp.t("mtp.0.exp_probs_b.bias"),
+                n_expert, n_expert_used,
+                LLM_FFN_SILU, hparams.expert_weights_norm,
+                hparams.expert_weights_scale,
+                (llama_expert_gating_func_type) hparams.expert_gating_func,
+                n_layer - 1,
+                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        ggml_tensor * cshexp = build_ffn(ccur,
+                mtp.t("mtp.0.ffn_up_shexp.weight"),   nullptr, nullptr,
+                mtp.t("mtp.0.ffn_gate_shexp.weight"), nullptr, nullptr,
+                mtp.t("mtp.0.ffn_down_shexp.weight"), nullptr, nullptr,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, n_layer - 1);
+        ccur = ggml_add(ctx0, cmoe, cshexp);
+        chc = dsv4_hc_post(ctx0, ccur, cres, cmix.post, cmix.comb, n_embd, n_hc, nc);
+
+        ccur = dsv4_hc_head(ctx0, chc,
+                mtp.t("mtp.0.hc_head_fn.weight"), mtp.t("mtp.0.hc_head_scale.weight"),
+                mtp.t("mtp.0.hc_head_base.weight"),
+                n_embd, n_hc, nc, norm_rms_eps, hparams.hc_eps);
+        ccur = build_norm(ccur, mtp.t("mtp.0.norm.weight"), nullptr, LLM_NORM_RMS, -1);
+        ccur = ggml_mul_mat(ctx0, model.output, ccur);                          // [n_vocab, nc]
+        ggml_tensor * cdraft = ggml_argmax(ctx0, ccur);                         // i32 [nc]
+        ggml_set_name(cdraft, "mtp_spec_draft");
+        ggml_set_output(cdraft);
+        ggml_build_forward_expand(gf, cdraft);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MTP speculative-decode client interface (phase B). Plain C symbols so the
+// test tool can declare them without a header. All are no-ops / false unless
+// DSV4_MTP_GGUF was loaded.
+// ---------------------------------------------------------------------------
+
+extern "C" bool dsv4_mtp_spec_ready(void) {
+    return dsv4_mtp_get().ok;
+}
+
+// Mark ring rows as holding the MTP KV of these absolute positions. Call
+// after every successful llama_decode with the batch's positions (graph
+// warmup/reserve runs never go through here, so they cannot corrupt state).
+extern "C" void dsv4_mtp_spec_commit(const int32_t * pos, int32_t n) {
+    dsv4_mtp_module & m = dsv4_mtp_get();
+    if (m.ring_kv == nullptr || pos == nullptr) {
+        return;
+    }
+    for (int32_t i = 0; i < n; ++i) {
+        m.ring_pos_cpu[pos[i] % DSV4_MTP_RING] = pos[i];
+    }
+}
+
+// Set the HC seed for the next batch's first token (= final-layer HC of the
+// token right before it; take the right column of the mtp_hc_hist output).
+extern "C" void dsv4_mtp_spec_set_seed(const float * hc, int64_t n) {
+    dsv4_mtp_module & m = dsv4_mtp_get();
+    m.hc_seed_cpu.assign(hc, hc + n);
+}
+
+// Rewind position p0 (a rejected draft) out of the caches. Legal ONLY when p0
+// did not close a compression chunk (the client gates speculation so that
+// (p0+1) % ratio != 0 for every compressed ratio): between boundaries the
+// recurrent compressor state never advanced (writes go to a scratch row), so
+// only the attention caches and the recurrent tail-pos marker need rewinding.
+extern "C" bool dsv4_mtp_spec_rollback(llama_memory_t mem, int32_t seq_id, int32_t p0) {
+    auto * hyb = dynamic_cast<llama_memory_hybrid_iswa *>(mem);
+    if (hyb == nullptr) {
+        return false;
+    }
+    if (!hyb->get_mem_attn()->seq_rm(seq_id, p0, -1)) {
+        return false;
+    }
+    hyb->get_mem_recr()->seq_add(seq_id, p0, p0 + 1, -1);
+    return true;
 }

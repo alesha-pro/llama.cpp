@@ -19,6 +19,7 @@ else()
     add_subdirectory(embedding)
     add_subdirectory(eval-callback)
     add_subdirectory(ds4-mtp-accept)
+    add_subdirectory(ds4-mtp-spec)
 
     add_subdirectory(gguf-hash)
     add_subdirectory(gguf)
