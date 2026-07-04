@@ -305,7 +305,10 @@ static __host__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, const int DV,
 
 static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, const int DV, const int ncols1, const int ncols2, const bool use_top_k) {
 #ifdef CP_ASYNC_AVAILABLE
-    return ncols2 >= 2 && !use_top_k ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2) : 0;
+    // top_k gather now supports single-stage cp.async loads; both top-k
+    // geometries (576/16, 512/8) have nstages_target == 1, and the multi-stage
+    // pipeline still static_asserts against use_top_k
+    return ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2) : 0;
 #else
     GGML_UNUSED_VARS(DKQ, DV, ncols1, ncols2, use_top_k);
     return 0;
@@ -325,8 +328,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
     if constexpr (use_cp_async) {
         static_assert(warp_size == 32, "bad warp_size");
         static_assert(!oob_check, "OOB check not compatible with cp_async");
-        static_assert(!use_top_k, "top_k not compatible with cp_async");
-        constexpr int preload = 64;
+        // top_k gather: rows are contiguous and 16B-aligned, only the row base
+        // comes from the index list. L2 preload hints are useless for scattered
+        // rows, so disable them (they would fetch unrelated neighbors).
+        constexpr int preload = use_top_k ? 0 : 64;
 
         const unsigned int tile_KV_32 = ggml_cuda_cvta_generic_to_shared(tile_KV);
 
@@ -348,11 +353,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                     break;
                 }
 
+                const int64_t i_KV = use_top_k ? (int64_t) top_k[i] : (int64_t) i;
+
 #pragma unroll
                 for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
                     const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
 
-                    cp_async_cg_16<preload>(tile_KV_32 + i*(stride_tile*sizeof(half2)) + k*16, KV + i*stride_KV + k*h2_per_chunk);
+                    cp_async_cg_16<preload>(tile_KV_32 + i*(stride_tile*sizeof(half2)) + k*16, KV + i_KV*stride_KV + k*h2_per_chunk);
                 }
             }
         };
@@ -566,7 +573,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         constexpr bool use_cp_async = nstages == 1;
         if (ncols2 > 1 || mask_h) {
             if constexpr (use_top_k) {
-                flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_top_k>
+                // mask gather reads scattered 2-byte elements - below cp.async
+                // granularity, keep the sync path
+                flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, false, oob_check, use_top_k>
                     (mask_h, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01, tile_top_k);
             } else {
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_top_k>
@@ -583,16 +592,19 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int k0_diff = k0_stop - k0_start;
 
         if constexpr (nstages <= 1) {
-            constexpr bool use_cp_async = nstages == 1;
+            // the top-k gather can use cp.async only on full tiles (cp.async
+            // cannot be predicated per-row); the ragged last iter of the top-k
+            // path runs with oob_check=true and falls back to sync loads
+            constexpr bool kv_cp_async = nstages == 1 && !(use_top_k && oob_check);
             if constexpr (use_top_k) {
-                flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_top_k>
+                flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, kv_cp_async, oob_check, use_top_k>
                     (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_sup, tile_top_k);
             } else {
-                flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_top_k>
+                flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, kv_cp_async, oob_check, use_top_k>
                     (K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start, tile_K, k0_diff, stride_K, k_VKQ_sup, tile_top_k);
             }
 
-            if (use_cp_async) {
+            if (kv_cp_async) {
                 cp_async_wait_all();
             }
             __syncthreads();
@@ -918,15 +930,17 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         if constexpr (nstages <= 1) {
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
-                constexpr bool use_cp_async = nstages == 1;
+                // same rule as the K load: the top-k gather supports cp.async
+                // only without OOB checks (ragged last iter falls back to sync)
+                constexpr bool v_cp_async = nstages == 1 && !(use_top_k && oob_check);
                 if constexpr (use_top_k) {
-                    flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_top_k>
+                    flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, v_cp_async, oob_check, use_top_k>
                         (V_h2 + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_sup, tile_top_k);
                 } else {
-                    flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_top_k>
+                    flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, v_cp_async, oob_check, use_top_k>
                         (V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_sup, tile_top_k);
                 }
-                if (use_cp_async) {
+                if (v_cp_async) {
                     cp_async_wait_all();
                 }
                 __syncthreads();
@@ -1184,7 +1198,31 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     }
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
-    if constexpr (ncols2 == 1 || use_top_k) {
+    if constexpr (use_top_k) {
+        // non-last tiles are always full, so they can skip the OOB checks -
+        // which also unlocks the cp.async gather path in load_tile; only the
+        // (possibly ragged) last tile needs oob_check
+        for (; kb0 < kb0_stop-1; ++kb0) {
+            constexpr bool last_iter = false;
+            constexpr bool oob_check = false;
+            constexpr int  k_VKQ_sup = nbatch_fa;
+            flash_attn_ext_f16_iter
+                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check, use_top_k,
+                 T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                (Q_f2, K_h2, V_h2, mask_h, top_k, dstk, dstk_fixup, scale, slope, logit_softcap,
+                 ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+        }
+        constexpr bool last_iter = true;
+        constexpr bool oob_check = true;
+        const     int  k_VKQ_sup = n_kv_iter - kb0*nbatch_fa;
+        flash_attn_ext_f16_iter
+            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check, use_top_k,
+              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+            (Q_f2, K_h2, V_h2, mask_h, top_k, dstk, dstk_fixup, scale, slope, logit_softcap,
+             ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+    } else if constexpr (ncols2 == 1) {
         constexpr bool oob_check = true;
         for (; kb0 < kb0_stop-1; ++kb0) {
             constexpr bool last_iter = false;
