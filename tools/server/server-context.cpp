@@ -34,6 +34,19 @@
 
 using json = nlohmann::ordered_json;
 
+// DS4-Flash in-graph MTP speculation (--spec-type dsv4-mtp): the hybrid context
+// cannot partial-seq_rm, so rejected drafts are rewound through these instead
+// (attention seq_rm + recurrent tail-pos fix + recurrent state shadows).
+extern "C" bool dsv4_mtp_spec_ready(void);
+extern "C" bool dsv4_mtp_spec_rollback(llama_memory_t mem, int32_t seq_id, int32_t p0, int32_t last_pos);
+extern "C" bool dsv4_mtp_state_shadow(llama_memory_t mem, int32_t n_layer, int32_t op); // 1=save 2=restore
+
+// draft position p closes a ratio-4/128 compression chunk (recurrent state
+// advances there - a reject then needs the shadow restore, not just seq_rm)
+static bool dsv4_closes_chunk(llama_pos p) {
+    return ((p + 1) % 4) == 0 || ((p + 1) % 128) == 0;
+}
+
 constexpr int HTTP_POLLING_SECONDS = 1;
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
@@ -67,6 +80,9 @@ struct server_slot {
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
+
+    // dsv4-mtp: recurrent state shadows were saved for the in-flight draft
+    bool dsv4_shadow_saved = false;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -615,6 +631,10 @@ private:
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
+    // dsv4-mtp in-graph speculation is active (bypasses the seq_rm_type gate)
+    bool    dsv4_mtp_spec = false;
+    int32_t dsv4_n_layer  = 0;
+
     common_speculative_ptr spec;
 
     bool add_bos_token = true;
@@ -820,7 +840,25 @@ private:
         slots.clear();
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
-        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+
+        // DS4-Flash + in-graph MTP: the hybrid context reports SEQ_RM_TYPE_NO,
+        // but rejected K=1 drafts can still be rewound via dsv4_mtp_spec_rollback
+        // (+ recurrent state shadows across chunk boundaries), so speculation is
+        // allowed when the dsv4-mtp type was explicitly requested
+        dsv4_mtp_spec =
+            std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                    COMMON_SPECULATIVE_TYPE_DSV4_MTP) != params_base.speculative.types.end() &&
+            dsv4_mtp_spec_ready() &&
+            getenv("DSV4_MTP_SPEC") != nullptr &&
+            params_base.n_parallel == 1;
+
+        if (dsv4_mtp_spec) {
+            dsv4_n_layer = llama_model_n_layer(model_tgt);
+            params_base.speculative.draft.ctx_tgt = ctx_tgt;
+            SRV_INF("%s", "dsv4-mtp speculative decoding enabled (in-graph MTP drafts, custom rollback)\n");
+        }
+
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO && !dsv4_mtp_spec) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
 
@@ -834,12 +872,16 @@ private:
         }
 
         // try speculative decoding
-        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO || dsv4_mtp_spec) {
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
             }
+        }
+
+        if (dsv4_mtp_spec && !spec) {
+            dsv4_mtp_spec = false;
         }
 
         if (spec) {
@@ -2274,6 +2316,21 @@ private:
                 llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id, ckpt.pos_max + 1, -1);
             }
 
+            if (!draft.empty() && dsv4_mtp_spec) {
+                // a rejected draft that closes a compression chunk would leave a
+                // junk chunk committed in the recurrent state - shadow it now so
+                // the reject path can restore (accepts don't need anything)
+                slot.dsv4_shadow_saved = false;
+                for (size_t k = 0; k < draft.size(); ++k) {
+                    const llama_pos p = slot.prompt.tokens.pos_next() + 1 + (llama_pos) k;
+                    if (dsv4_closes_chunk(p)) {
+                        dsv4_mtp_state_shadow(llama_get_memory(ctx_tgt), dsv4_n_layer, 1);
+                        slot.dsv4_shadow_saved = true;
+                        break;
+                    }
+                }
+            }
+
             if (!draft.empty()) {
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
@@ -3181,6 +3238,10 @@ private:
                 // update how many tokens out of those tested were accepted
                 slot.n_draft_accepted += ids.size() - 1;
 
+                // last decoded position of the verify batch (the recurrent
+                // tail-pos marker sits there - the dsv4 rollback rewinds it)
+                const llama_pos dsv4_last_pos = slot.prompt.tokens.pos_next() - 1;
+
                 // add accepted tokens to the prompt
                 slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
                 slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
@@ -3188,7 +3249,24 @@ private:
                 slot.sampled = ids.back(); // last accepted token
                 SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-                llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), slot.id, slot.prompt.tokens.pos_next(), -1);
+                if (dsv4_mtp_spec) {
+                    // the hybrid context cannot partial-seq_rm - rewind rejected
+                    // draft positions via the MTP rollback (attention seq_rm +
+                    // recurrent tail-pos fix), restoring shadowed recurrent
+                    // states first if the rejected range closed a chunk
+                    if (ids.size() < n_draft + 1) {
+                        if (slot.dsv4_shadow_saved) {
+                            dsv4_mtp_state_shadow(llama_get_memory(slot.ctx_tgt), dsv4_n_layer, 2);
+                        }
+                        if (!dsv4_mtp_spec_rollback(llama_get_memory(slot.ctx_tgt), slot.id,
+                                    slot.prompt.tokens.pos_next(), dsv4_last_pos)) {
+                            SLT_ERR(slot, "dsv4-mtp rollback failed at pos %d\n", slot.prompt.tokens.pos_next());
+                        }
+                    }
+                    slot.dsv4_shadow_saved = false;
+                } else {
+                    llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), slot.id, slot.prompt.tokens.pos_next(), -1);
+                }
                 if (slot.ctx_dft) {
                     llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), slot.id, slot.prompt.tokens.pos_next(), -1);
                 }

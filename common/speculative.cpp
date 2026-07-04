@@ -27,7 +27,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"dsv4-mtp",      COMMON_SPECULATIVE_TYPE_DSV4_MTP}
 };
 
 struct common_speculative_config {
@@ -754,6 +755,186 @@ struct common_speculative_state_ngram_cache : public common_speculative_impl {
     }
 };
 
+// DS4-Flash in-graph MTP speculation (K=1). When the target graph is built
+// with DSV4_MTP_SPEC=1 it already drafts the next token for BOTH outcomes of
+// the current verify pair (reject -> candidate 0, accept -> candidate 1) and
+// exports them via static buffers, so drafting costs the server nothing extra.
+// This impl reads those statics after each decode (process) and, knowing which
+// outcome materialized (draft), does the client-side bookkeeping the MTP module
+// requires: ring-row commits of accepted positions + the HC seed of the next
+// batch's first token. Cache rollback of rejected drafts is handled by the
+// server via dsv4_mtp_spec_rollback (the hybrid context cannot partial-seq_rm).
+extern "C" bool    dsv4_mtp_spec_ready(void);
+extern "C" void    dsv4_mtp_spec_commit(const int32_t * pos, int32_t n);
+extern "C" void    dsv4_mtp_spec_set_seed(const float * hc, int64_t n);
+extern "C" int64_t dsv4_mtp_spec_hc_elems(void);
+extern "C" bool    dsv4_mtp_spec_read_draft(int32_t * out, int32_t n);
+extern "C" bool    dsv4_mtp_spec_read_hist(float * out, int64_t n);
+
+struct common_speculative_state_dsv4_mtp : public common_speculative_impl {
+    llama_context * ctx_tgt;
+
+    int32_t n_vocab = 0;
+    int64_t hc_elems = 0;
+
+    // outputs captured from the last decode: up to 2 logit positions (single
+    // decode -> 1, verify pair -> 2), one column per possible outcome
+    int         n_out = 0;
+    llama_pos   out_pos   [2] = { -1, -1 };
+    llama_token out_argmax[2] = { -1, -1 }; // base-logits argmax per output position
+    int32_t     out_draft [2] = { -1, -1 }; // in-graph MTP candidate per outcome
+    std::vector<float> hist;                // [hc_elems x n_out] HC history columns
+
+    common_speculative_state_dsv4_mtp(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DSV4_MTP, n_seq)
+        , ctx_tgt(params.draft.ctx_tgt) {
+        if (n_seq != 1) {
+            throw std::runtime_error("dsv4-mtp speculation supports a single sequence only (use -np 1)");
+        }
+        if (ctx_tgt == nullptr) {
+            throw std::runtime_error("dsv4-mtp: target context not available");
+        }
+        if (!dsv4_mtp_spec_ready()) {
+            throw std::runtime_error("dsv4-mtp: MTP module not loaded (set DSV4_MTP_GGUF)");
+        }
+        if (std::getenv("DSV4_MTP_SPEC") == nullptr) {
+            throw std::runtime_error("dsv4-mtp: DSV4_MTP_SPEC=1 required so the target graph builds the draft branch");
+        }
+        n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt)));
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        GGML_ASSERT(seq_id == 0);
+
+        // mark the prompt as valid ring rows (the MTP ring keeps 128, commit a
+        // bit more than that to be safe about future ring-size changes)
+        const int32_t n  = (int32_t) prompt.size();
+        const int32_t i0 = std::max(0, n - 256);
+
+        std::vector<int32_t> pp;
+        pp.reserve(n - i0);
+        for (int32_t i = i0; i < n; ++i) {
+            pp.push_back(i);
+        }
+        dsv4_mtp_spec_commit(pp.data(), (int32_t) pp.size());
+
+        // seed the first generated token with the HC of the last prompt token;
+        // draft() normally re-does this, but cover the no-drafting edge cases
+        if (n_out > 0 && hc_elems > 0) {
+            dsv4_mtp_spec_set_seed(hist.data() + (size_t) (n_out - 1) * hc_elems, hc_elems);
+        }
+    }
+
+    bool process(const llama_batch & batch) override {
+        // find the last <=2 logit positions of this decode (oldest first)
+        int32_t   idx[2] = { -1, -1 };
+        llama_pos pos[2] = { -1, -1 };
+
+        int cnt = 0;
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            if (batch.logits[i]) {
+                idx[0] = idx[1]; pos[0] = pos[1];
+                idx[1] = i;      pos[1] = batch.pos[i];
+                cnt++;
+            }
+        }
+        if (cnt == 0) {
+            return true; // intermediate prompt chunk - nothing to capture
+        }
+        if (cnt == 1) {
+            idx[0] = idx[1];
+            pos[0] = pos[1];
+        }
+
+        hc_elems = dsv4_mtp_spec_hc_elems();
+        if (hc_elems == 0) {
+            return true; // spec graph not built yet (DSV4_MTP_SPEC unset?)
+        }
+
+        const int take = cnt < 2 ? cnt : 2; // outcomes we track (K=1 -> max 2)
+        const int nc   = cnt < 3 ? cnt : 3; // candidate columns the graph wrote
+        const int col0 = nc - take;         // ...we want the last `take` of them
+
+        // the candidates assume greedy continuation - remember the base argmax
+        // of each output so draft() can check the sampler actually picked it.
+        // llama_get_logits_ith is also the sync point: llama_decode is async and
+        // the MTP statics may not be written yet - do NOT reorder below the reads.
+        for (int k = 0; k < take; ++k) {
+            const float * lg = llama_get_logits_ith(ctx_tgt, idx[2 - take + k]);
+            if (lg == nullptr) {
+                n_out = 0;
+                return true;
+            }
+            int best = 0;
+            for (int32_t v = 1; v < n_vocab; ++v) {
+                if (lg[v] > lg[best]) {
+                    best = v;
+                }
+            }
+            out_argmax[k] = best;
+        }
+
+        int32_t dr[3] = { -1, -1, -1 };
+        std::vector<float> h3((size_t) hc_elems * nc);
+        if (!dsv4_mtp_spec_read_draft(dr, nc) || !dsv4_mtp_spec_read_hist(h3.data(), hc_elems * nc)) {
+            n_out = 0;
+            return true;
+        }
+
+        n_out = take;
+        hist.resize((size_t) take * hc_elems);
+        for (int k = 0; k < take; ++k) {
+            out_pos  [k] = pos[2 - take + k];
+            out_draft[k] = dr[col0 + k];
+            memcpy(hist.data() + (size_t) k * hc_elems,
+                   h3.data() + (size_t) (col0 + k) * hc_elems,
+                   (size_t) hc_elems * sizeof(float));
+        }
+
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        auto & dp = dparams[0];
+        if (!dp.drafting) {
+            return;
+        }
+        if (n_out <= 0) {
+            return;
+        }
+
+        // which outcome of the last decode materialized: the token about to be
+        // decoded (id_last) sits at position n_past, right after out_pos[branch]
+        const int branch = (int) (dp.n_past - 1 - out_pos[0]);
+        if (branch < 0 || branch >= n_out) {
+            n_out = 0; // lost track (edge path skipped a round) - resync on next decode
+            return;
+        }
+
+        // bookkeeping for the outcome: accepted ring rows become valid, and the
+        // next batch's first token is seeded with the HC of its predecessor
+        int32_t cp[2];
+        for (int k = 0; k <= branch; ++k) {
+            cp[k] = (int32_t) out_pos[k];
+        }
+        dsv4_mtp_spec_commit(cp, branch + 1);
+        dsv4_mtp_spec_set_seed(hist.data() + (size_t) branch * hc_elems, hc_elems);
+
+        // the in-graph candidate continues the ARGMAX of the base logits; with
+        // temp > 0 the sampler may pick another token - then the draft is for a
+        // prefix that does not exist and must be skipped (greedy always drafts)
+        if (out_draft[branch] >= 0 && dp.id_last == out_argmax[branch]) {
+            dp.result->push_back(out_draft[branch]);
+        }
+
+        n_out = 0; // consumed - one capture drives exactly one bookkeeping step
+    }
+
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/) override {
+        // noop - outcome bookkeeping happens in draft(), rollback in the server
+    }
+};
+
 struct common_speculative {
     common_speculative_draft_params_vec dparams;
 
@@ -825,6 +1006,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_DSV4_MTP:      return "dsv4-mtp";
         default:                                    return "unknown";
     }
 }
@@ -883,9 +1065,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_ngram_map_k   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K));
         bool has_ngram_map_k4v = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V));
         bool has_ngram_mod     = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MOD));
+        bool has_dsv4_mtp      = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DSV4_MTP));
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 8);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 9);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -922,6 +1105,17 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         // TODO: add MTP here
         if (has_draft_eagle3) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_EAGLE3, params));
+        }
+
+        if (has_dsv4_mtp) {
+            // the rejected-draft rollback path (dsv4_mtp_spec_rollback + state
+            // shadows) only covers the K=1 drafts this impl produces - mixing in
+            // other speculators would create multi-token rejects it cannot rewind
+            if (!configs.empty()) {
+                LOG_WRN("%s: dsv4-mtp must be the only speculative type - ignoring the others\n", __func__);
+                configs.clear();
+            }
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DSV4_MTP, params));
         }
     }
 
@@ -976,6 +1170,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                         params.ngram_cache.lookup_cache_static,
                         params.ngram_cache.lookup_cache_dynamic);
                 impls.push_back(std::make_unique<common_speculative_state_ngram_cache>(state));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DSV4_MTP: {
+                impls.push_back(std::make_unique<common_speculative_state_dsv4_mtp>(config.params, n_seq));
                 break;
             }
             default:

@@ -164,6 +164,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_DSV4_MTP,      // DS4-Flash in-graph MTP head (drafts are computed by the target graph itself)
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 

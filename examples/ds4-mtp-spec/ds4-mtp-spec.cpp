@@ -31,7 +31,7 @@ extern "C" bool    dsv4_mtp_spec_ready(void);
 extern "C" bool    dsv4_mtp_state_shadow(llama_memory_t mem, int32_t n_layer, int32_t op); // 1=save 2=restore
 extern "C" void    dsv4_mtp_spec_commit(const int32_t * pos, int32_t n);
 extern "C" void    dsv4_mtp_spec_set_seed(const float * hc, int64_t n);
-extern "C" bool    dsv4_mtp_spec_rollback(llama_memory_t mem, int32_t seq_id, int32_t p0);
+extern "C" bool    dsv4_mtp_spec_rollback(llama_memory_t mem, int32_t seq_id, int32_t p0, int32_t last_pos);
 extern "C" int64_t dsv4_mtp_spec_hc_elems(void);
 extern "C" bool    dsv4_mtp_spec_read_draft(int32_t * out, int32_t n);
 extern "C" bool    dsv4_mtp_spec_read_hist(float * out, int64_t n);
@@ -345,7 +345,7 @@ int main(int argc, char ** argv) {
                 n_rej++;
                 spec_out.push_back(A);
                 if (save_state) dsv4_mtp_state_shadow(mem, n_layers, 2);
-                if (!dsv4_mtp_spec_rollback(mem, 0, pos + 1)) {
+                if (!dsv4_mtp_spec_rollback(mem, 0, pos + 1, pos + 1)) {
                     fprintf(stderr, "rollback failed at pos %d\n", pos + 1);
                     return 1;
                 }
