@@ -27,36 +27,32 @@
 #include <vector>
 #include <chrono>
 
-extern "C" bool dsv4_mtp_spec_ready(void);
-extern "C" void dsv4_mtp_spec_commit(const int32_t * pos, int32_t n);
-extern "C" void dsv4_mtp_spec_set_seed(const float * hc, int64_t n);
-extern "C" bool dsv4_mtp_spec_rollback(llama_memory_t mem, int32_t seq_id, int32_t p0);
+extern "C" bool    dsv4_mtp_spec_ready(void);
+extern "C" bool    dsv4_mtp_state_shadow(llama_memory_t mem, int32_t n_layer, int32_t op); // 1=save 2=restore
+extern "C" void    dsv4_mtp_spec_commit(const int32_t * pos, int32_t n);
+extern "C" void    dsv4_mtp_spec_set_seed(const float * hc, int64_t n);
+extern "C" bool    dsv4_mtp_spec_rollback(llama_memory_t mem, int32_t seq_id, int32_t p0);
+extern "C" int64_t dsv4_mtp_spec_hc_elems(void);
+extern "C" bool    dsv4_mtp_spec_read_draft(int32_t * out, int32_t n);
+extern "C" bool    dsv4_mtp_spec_read_hist(float * out, int64_t n);
 
+// post-decode snapshot of the graph's static MTP outputs
 struct cb_state {
-    std::vector<int32_t> draft;   // mtp_spec_draft [nc]
-    std::vector<float>   hist;    // mtp_hc_hist [n_embd*n_hc*nh]
-    int64_t hist_cols = 0;        // nh
-    int64_t hc_elems  = 0;        // n_embd*n_hc
-};
+    int32_t draft[2] = { -1, -1 };
+    std::vector<float> hist;      // [hc_elems * 2]
+    int64_t hc_elems = 0;
 
-static bool eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
-    cb_state * s = (cb_state *) user_data;
-    const bool is_draft = strcmp(t->name, "mtp_spec_draft") == 0;
-    const bool is_hist  = strcmp(t->name, "mtp_hc_hist") == 0;
-    if (ask) {
-        return is_draft || is_hist;
+    bool fetch() {
+        if (hc_elems == 0) {
+            hc_elems = dsv4_mtp_spec_hc_elems();
+            if (hc_elems == 0) return false;
+            hist.resize((size_t) hc_elems * 2);
+        }
+        return dsv4_mtp_spec_read_draft(draft, 2) &&
+               dsv4_mtp_spec_read_hist(hist.data(), hc_elems * 2);
     }
-    if (is_draft) {
-        s->draft.resize(t->ne[0]);
-        ggml_backend_tensor_get(t, s->draft.data(), 0, ggml_nbytes(t));
-    } else if (is_hist) {
-        s->hc_elems  = t->ne[0] * t->ne[1];
-        s->hist_cols = t->ne[2];
-        s->hist.resize((size_t)(s->hc_elems * s->hist_cols));
-        ggml_backend_tensor_get(t, s->hist.data(), 0, ggml_nbytes(t));
-    }
-    return true;
-}
+    const float * hist_col(int c) const { return hist.data() + (size_t) c * hc_elems; }
+};
 
 static int argmax_row(const float * row, int n) {
     int best = 0;
@@ -77,7 +73,9 @@ int main(int argc, char ** argv) {
     const char * text_path  = nullptr;
     int   n_ctx  = 8192;
     int   n_gen  = 256;
-    int   gate   = 1;
+    int   gate   = 3;   // 3 = snapshot mode (speculate always, shadow recurrent
+                        // state across boundary-closing drafts); 0/1 legacy gates,
+                        // 2 = perf-test only (no state protection)
     float ts[16] = {0};
     bool  has_ts = false;
     bool  spec_only = false;
@@ -120,7 +118,8 @@ int main(int argc, char ** argv) {
     if (!model) { fprintf(stderr, "model load failed\n"); return 1; }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
-    const int n_vocab = llama_vocab_n_tokens(vocab);
+    const int n_vocab  = llama_vocab_n_tokens(vocab);
+    const int n_layers = llama_model_n_layer(model);
     const llama_token eos = llama_vocab_eos(vocab);
 
     int n_tok = -llama_tokenize(vocab, text.c_str(), (int32_t) text.size(), nullptr, 0, true, false);
@@ -135,24 +134,22 @@ int main(int argc, char ** argv) {
     cb_state st;
     llama_batch batch = llama_batch_init(512, 0, 1);
 
-    auto make_ctx = [&](bool with_cb) -> llama_context * {
+    auto make_ctx = [&](bool /*unused*/) -> llama_context * {
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx           = n_ctx;
         cp.n_batch         = 512;
         cp.n_ubatch        = 512;
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-        if (with_cb) {
-            cp.cb_eval           = eval_cb;
-            cp.cb_eval_user_data = &st;
-        }
         return llama_init_from_model(model, cp);
     };
 
     // prefill in 512-token chunks; logits on the last <=2 positions of every
     // chunk (the spec graph needs n_outputs>=1; the final chunk needs 2).
+    int prefill_last_nt = 0;
     auto prefill = [&](llama_context * ctx) -> bool {
         for (int pos = 0; pos < n_tok; pos += 512) {
             const int nt = std::min(512, n_tok - pos);
+            prefill_last_nt = nt;
             batch.n_tokens = nt;
             for (int i = 0; i < nt; ++i) {
                 batch.token[i]     = prompt[pos + i];
@@ -257,18 +254,21 @@ int main(int argc, char ** argv) {
         llama_context * ctx = make_ctx(true);
         if (!ctx || !prefill(ctx)) return 1;
         if (!dsv4_mtp_spec_ready()) { fprintf(stderr, "mtp module not loaded\n"); return 1; }
-        // commit whole prompt into the ring bookkeeping + set the seed
+        // commit whole prompt into the ring bookkeeping + set the seed.
+        // NOTE: llama_decode is async — llama_get_logits() is the sync point,
+        // so it must come BEFORE reading the MTP static outputs.
+        const float * lg = llama_get_logits(ctx);
+        const int nh_pref = std::min(2, prefill_last_nt);
         {
             std::vector<int32_t> pp(n_tok);
             for (int i = 0; i < n_tok; ++i) pp[i] = i;
             dsv4_mtp_spec_commit(pp.data(), n_tok);
-            if (st.hist_cols < 1) { fprintf(stderr, "no hc_hist captured\n"); return 1; }
-            dsv4_mtp_spec_set_seed(st.hist.data() + (size_t)(st.hist_cols - 1) * st.hc_elems, st.hc_elems);
+            if (!st.fetch()) { fprintf(stderr, "no mtp static outputs captured\n"); return 1; }
+            dsv4_mtp_spec_set_seed(st.hist_col(nh_pref - 1), st.hc_elems);
         }
-        const float * lg = llama_get_logits(ctx);
         int n_rows_last = std::min(2, n_tok);
         llama_token A = argmax_row(lg + (size_t)(n_rows_last - 1) * n_vocab, n_vocab);
-        llama_token D = st.draft.empty() ? -1 : st.draft.back();
+        llama_token D = st.draft[nh_pref - 1];
         llama_memory_t mem = llama_get_memory(ctx);
 
         auto t0 = std::chrono::steady_clock::now();
@@ -291,24 +291,32 @@ int main(int argc, char ** argv) {
         while ((int) spec_out.size() < n_gen) {
             if (A == eos) { spec_out.push_back(A); break; }
             const bool can_spec = D >= 0 &&
-                !closes_chunk(pos + 1) &&                 // draft pos must be rewindable
-                (gate == 0 || !closes_chunk(pos));        // gate 1: no boundary inside verify at all
+                (gate >= 2 ||                             // 2: perf test; 3: snapshot mode
+                 (!closes_chunk(pos + 1) &&               // draft pos must be rewindable
+                  (gate == 0 || !closes_chunk(pos))));    // gate 1: no boundary inside verify
             if (!can_spec) {
                 spec_out.push_back(A);
                 batch.n_tokens = 1;
                 batch.token[0] = A; batch.pos[0] = pos;
                 batch.n_seq_id[0] = 1; batch.seq_id[0][0] = 0; batch.logits[0] = true;
                 if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "spec single decode failed\n"); return 1; }
+                A = argmax_row(llama_get_logits(ctx), n_vocab);  // sync point first
                 int32_t cp = pos;
                 dsv4_mtp_spec_commit(&cp, 1);
-                dsv4_mtp_spec_set_seed(st.hist.data(), st.hc_elems); // nh==1
-                A = argmax_row(llama_get_logits(ctx), n_vocab);
-                D = st.draft.empty() ? -1 : st.draft[0];
+                st.fetch();
+                dsv4_mtp_spec_set_seed(st.hist_col(0), st.hc_elems); // nh==1
+                D = st.draft[0];
                 pos++;
                 n_single++;
                 continue;
             }
             // verify decode: [A @ pos, D @ pos+1]
+            // Snapshot mode: if the DRAFT position closes a compression chunk, a
+            // reject would leave a junk chunk committed in the recurrent state —
+            // shadow-save now, restore on reject. (A boundary on the ACCEPTED
+            // first position needs nothing: its commit is valid either way.)
+            const bool save_state = gate == 3 && closes_chunk(pos + 1);
+            if (save_state) dsv4_mtp_state_shadow(mem, n_layers, 1);
             const llama_token D_use = force_reject ? (llama_token)((D + 1) % n_vocab) : D;
             batch.n_tokens = 2;
             batch.token[0] = A; batch.pos[0] = pos;
@@ -318,8 +326,9 @@ int main(int argc, char ** argv) {
             }
             if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "spec verify decode failed\n"); return 1; }
             n_spec++;
-            const float * L  = llama_get_logits(ctx);
+            const float * L  = llama_get_logits(ctx);            // sync point first
             const llama_token B0 = argmax_row(L, n_vocab);
+            st.fetch();
             if (B0 == D_use) {
                 // accept: both tokens stand
                 n_acc++;
@@ -327,23 +336,24 @@ int main(int argc, char ** argv) {
                 spec_out.push_back(D_use);
                 int32_t cp[2] = { pos, pos + 1 };
                 dsv4_mtp_spec_commit(cp, 2);
-                dsv4_mtp_spec_set_seed(st.hist.data() + (size_t) st.hc_elems, st.hc_elems); // col 1
+                dsv4_mtp_spec_set_seed(st.hist_col(1), st.hc_elems);
                 A = argmax_row(L + (size_t) n_vocab, n_vocab);
-                D = st.draft.size() > 1 ? st.draft[1] : -1;
+                D = st.draft[1];
                 pos += 2;
             } else {
                 // reject: rewind pos+1 everywhere
                 n_rej++;
                 spec_out.push_back(A);
+                if (save_state) dsv4_mtp_state_shadow(mem, n_layers, 2);
                 if (!dsv4_mtp_spec_rollback(mem, 0, pos + 1)) {
                     fprintf(stderr, "rollback failed at pos %d\n", pos + 1);
                     return 1;
                 }
                 int32_t cp = pos;
                 dsv4_mtp_spec_commit(&cp, 1);
-                dsv4_mtp_spec_set_seed(st.hist.data(), st.hc_elems);   // col 0
+                dsv4_mtp_spec_set_seed(st.hist_col(0), st.hc_elems);
                 A = B0;
-                D = st.draft.empty() ? -1 : st.draft[0];
+                D = st.draft[0];
                 pos += 1;
             }
         }

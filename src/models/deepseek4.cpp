@@ -243,6 +243,10 @@ struct dsv4_index_entry {
     int64_t       ratio  = 0;
     int64_t       base   = 0;
     dsv4_idx_mode mode   = dsv4_idx_mode::POS_MOD;
+    // Position offset applied BEFORE the mode formula: the effective position
+    // is last_pos + off. Lets the unrolled nt=2 verify pair drive per-token
+    // scalar inputs (off = -1 for the pair's first token, 0 for the second).
+    int64_t       off    = 0;
 };
 
 // Feature flag (env DSV4_CONSTANT_SHAPE): build the decode compressed-attention
@@ -349,34 +353,39 @@ public:
     // Dedup by (ratio, base, mode): every layer with the same params shares ONE
     // input, else we'd blow past GGML_SCHED_MAX_SPLIT_INPUTS.
     ggml_tensor * add_scalar_input(ggml_context * ctx, int64_t ratio, int64_t base,
-                                   dsv4_idx_mode mode, ggml_type type, const char * name) {
+                                   dsv4_idx_mode mode, ggml_type type, const char * name,
+                                   int64_t off = 0) {
         for (const auto & ie : indices) {
-            if (ie.ratio == ratio && ie.base == base && ie.mode == mode) {
+            if (ie.ratio == ratio && ie.base == base && ie.mode == mode && ie.off == off) {
                 return ie.tensor;
             }
         }
         ggml_tensor * t = ggml_new_tensor_1d(ctx, type, 1);
         ggml_set_input(t);
         ggml_set_name(t, name);
-        indices.push_back({ t, ratio, base, mode });
+        indices.push_back({ t, ratio, base, mode, off });
         return t;
     }
 
-    ggml_tensor * add_index(ggml_context * ctx, int64_t ratio, int64_t base, const char * name) {
-        return add_scalar_input(ctx, ratio, base, dsv4_idx_mode::POS_MOD, GGML_TYPE_I32, name);
+    ggml_tensor * add_index(ggml_context * ctx, int64_t ratio, int64_t base, const char * name,
+                            int64_t off = 0) {
+        return add_scalar_input(ctx, ratio, base, dsv4_idx_mode::POS_MOD, GGML_TYPE_I32, name, off);
     }
     // RoPE position of the compressed chunk emitted this step (= last_pos+1-ratio).
-    ggml_tensor * add_comp_pos_index(ggml_context * ctx, int64_t ratio, const char * name) {
-        return add_scalar_input(ctx, ratio, 0, dsv4_idx_mode::COMP_POS, GGML_TYPE_I32, name);
+    ggml_tensor * add_comp_pos_index(ggml_context * ctx, int64_t ratio, const char * name,
+                                     int64_t off = 0) {
+        return add_scalar_input(ctx, ratio, 0, dsv4_idx_mode::COMP_POS, GGML_TYPE_I32, name, off);
     }
     // Cache write row: real completed-chunk row on a compression boundary, else a
     // throwaway scratch row (so the always-built store never corrupts a real row).
-    ggml_tensor * add_comp_row_index(ggml_context * ctx, int64_t ratio, int64_t scratch_row, const char * name) {
-        return add_scalar_input(ctx, ratio, scratch_row, dsv4_idx_mode::COMP_ROW, GGML_TYPE_I32, name);
+    ggml_tensor * add_comp_row_index(ggml_context * ctx, int64_t ratio, int64_t scratch_row, const char * name,
+                                     int64_t off = 0) {
+        return add_scalar_input(ctx, ratio, scratch_row, dsv4_idx_mode::COMP_ROW, GGML_TYPE_I32, name, off);
     }
     // 1.0 on a compression boundary, else 0.0 (selects shifted vs unshifted state).
-    ggml_tensor * add_boundary_flag(ggml_context * ctx, int64_t ratio, const char * name) {
-        return add_scalar_input(ctx, ratio, 0, dsv4_idx_mode::BOUNDARY_FLAG, GGML_TYPE_F32, name);
+    ggml_tensor * add_boundary_flag(ggml_context * ctx, int64_t ratio, const char * name,
+                                    int64_t off = 0) {
+        return add_scalar_input(ctx, ratio, 0, dsv4_idx_mode::BOUNDARY_FLAG, GGML_TYPE_F32, name, off);
     }
 
     // --- MTP speculative-decode inputs (phase B) ------------------------
@@ -432,18 +441,19 @@ public:
                 continue;
             }
             const int64_t r = ie.ratio;
-            const bool boundary = (r > 0) && (((last_pos + 1) % r) == 0);
+            const llama_pos eff_pos = last_pos + ie.off;   // per-token offset (nt=2 unroll)
+            const bool boundary = (r > 0) && (((eff_pos + 1) % r) == 0);
             switch (ie.mode) {
                 case dsv4_idx_mode::POS_MOD: {
-                    const int32_t v = (int32_t)(ie.base + (r > 0 ? (last_pos % r) : 0));
+                    const int32_t v = (int32_t)(ie.base + (r > 0 ? (eff_pos % r) : 0));
                     ggml_backend_tensor_set(ie.tensor, &v, 0, sizeof(int32_t));
                 } break;
                 case dsv4_idx_mode::COMP_POS: {
-                    const int32_t v = (int32_t)(last_pos + 1 - r);
+                    const int32_t v = (int32_t)(eff_pos + 1 - r);
                     ggml_backend_tensor_set(ie.tensor, &v, 0, sizeof(int32_t));
                 } break;
                 case dsv4_idx_mode::COMP_ROW: {
-                    const int32_t v = boundary ? (int32_t)(((last_pos + 1) / r) - 1) : (int32_t)ie.base;
+                    const int32_t v = boundary ? (int32_t)(((eff_pos + 1) / r) - 1) : (int32_t)ie.base;
                     ggml_backend_tensor_set(ie.tensor, &v, 0, sizeof(int32_t));
                 } break;
                 case dsv4_idx_mode::BOUNDARY_FLAG: {
@@ -1784,6 +1794,9 @@ struct dsv4_mtp_module {
     ggml_context         * rctx = nullptr;   // ring tensor ctx
     ggml_backend_buffer_t  rbuf = nullptr;
     ggml_tensor          * ring_kv = nullptr; // [kv_w, DSV4_MTP_RING], fp8-kv type
+    ggml_tensor          * dout = nullptr;    // i32 [2]: draft tokens (static output)
+    ggml_tensor          * hout = nullptr;    // f32 [n_embd*n_hc*2]: hc_hist (static output)
+    int64_t   hc_elems = 0;                   // n_embd*n_hc
     int64_t   ring_pos_cpu[DSV4_MTP_RING];    // abs position per row, -1 empty
     std::vector<float> hc_seed_cpu;           // [n_embd*n_hc] HC of the token before the batch
 
@@ -1797,14 +1810,23 @@ struct dsv4_mtp_module {
     // spec-branch build). Zero-filled: unwritten rows are masked out by
     // ring_pos_cpu < 0, but FA still multiplies masked K rows by Q before the
     // -inf mask lands, and uninitialized memory could be NaN (0*NaN = NaN).
-    bool ensure_ring(ggml_type kv_type, int64_t kv_w) {
+    bool ensure_ring(ggml_type kv_type, int64_t kv_w, int64_t n_embd, int64_t n_hc) {
         if (ring_kv != nullptr) {
             return true;
         }
-        ggml_init_params rp = { 2 * ggml_tensor_overhead(), nullptr, /*no_alloc*/ true };
+        ggml_init_params rp = { 4 * ggml_tensor_overhead(), nullptr, /*no_alloc*/ true };
         rctx = ggml_init(rp);
         ring_kv = ggml_new_tensor_2d(rctx, kv_type, kv_w, DSV4_MTP_RING);
         ggml_set_name(ring_kv, "dsv4_mtp_ring_kv");
+        hc_elems = n_embd * n_hc;
+        // F32, not I32: CUDA has no I32->I32 CPY kernel, so an I32 static copy
+        // silently falls back to CPU and the device buffer never gets written
+        // (the draft reads were garbage). Cast to F32 in-graph instead; token
+        // ids up to ~2^24 are exact in F32.
+        dout = ggml_new_tensor_1d(rctx, GGML_TYPE_F32, 2);
+        ggml_set_name(dout, "dsv4_mtp_dout");
+        hout = ggml_new_tensor_1d(rctx, GGML_TYPE_F32, hc_elems * 2);
+        ggml_set_name(hout, "dsv4_mtp_hout");
         rbuf = ggml_backend_alloc_ctx_tensors_from_buft(rctx, wbuft);
         if (rbuf == nullptr) {
             fprintf(stderr, "dsv4-mtp: ring alloc failed\n");
@@ -2197,6 +2219,11 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                         "dsv4_attn_raw_window_mask");
             }
 
+            // set by the unrolled const-shape verify-pair path (nt==2) below;
+            // when non-null it IS the attention output and the shared pad+mha
+            // tail is skipped.
+            ggml_tensor * cs_pair_out = nullptr;
+
             if (!is_prefill) {
                 const llama_pos first_pos = ubatch.pos ? ubatch.pos[0] : 0;
                 const llama_pos last_pos  = ubatch.pos ? ubatch.pos[n_tokens - 1] : n_tokens - 1;
@@ -2257,6 +2284,189 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                     && first_pos % compress_ratio == 0
                     && n_tokens % compress_ratio == 0
                     && !dsv4_batched_chunk_disabled();
+
+                // ---- Unrolled constant-shape verify PAIR (n_tokens == 2) ----
+                // Speculative verify decodes are [accepted, draft] pairs. Run
+                // the proven nt=1 const-shape machinery TWICE inside one graph:
+                // per-token scalar inputs (off = -1 for token 0, 0 for token 1),
+                // compressor state chained token0 -> token1, one attention per
+                // token over column views. All shapes are depth-invariant, so
+                // the verify graph reuses + CUDA-graph replays like nt=1 decode.
+                const bool cs_pair = dsv4_constant_shape_enabled()
+                    && compress_ratio == 4 && n_tokens == 2
+                    && cs_nc_fixed < n_comp_cache
+                    && n_comp_visible > 0
+                    && ubatch.pos != nullptr
+                    && !dsv4_topk_gather_disabled();
+                if (cs_pair) {
+                    auto ccat = [&](ggml_tensor * a, ggml_tensor * b, int d, const char * tag) {
+                        if (a->type != b->type) {
+                            fprintf(stderr, "cs_pair concat type mismatch [%s]: %s vs %s\n",
+                                    tag, ggml_type_name(a->type), ggml_type_name(b->type));
+                        }
+                        return ggml_concat(ctx0, a, b, d);
+                    };
+                    const dsv4_state_layout index_state_layout =
+                        dsv4_make_state_layout(compress_ratio, hparams.indexer_head_size);
+                    ggml_tensor * prev_akv = prev_attn_kv_state;
+                    ggml_tensor * prev_asc = prev_attn_sc_state;
+                    ggml_tensor * prev_ikv = dsv4_view_state_segment(ctx0, prev_kv_state_all,
+                            attn_state_layout.elems, index_state_layout.width, index_state_layout.rows);
+                    ggml_tensor * prev_isc = dsv4_view_state_segment(ctx0, prev_sc_state_all,
+                            attn_state_layout.elems, index_state_layout.width, index_state_layout.rows);
+
+                    // regime keyed to last_pos; per-row mask content keeps
+                    // token 0 honest when the pair straddles a bucket edge
+                    const bool pair_gather = n_comp_visible > cs_nc_fixed;
+                    const int64_t top_k  = hparams.indexer_top_k;
+                    const int64_t nc_idx = pair_gather
+                        ? std::min<int64_t>(GGML_PAD(n_comp_visible, DSV4_CS_BUCKET), n_comp_cache - 1)
+                        : cs_nc_fixed;
+                    ggml_tensor * fixed_mask = pair_gather ? nullptr
+                        : get_dsv4_inputs()->add_mask(ctx0, dsv4_mask_kind::COMPRESS_FIXED,
+                                cs_nc_fixed, n_tokens, 0, n_comp_visible, 0, compress_ratio,
+                                "dsv4_attn_compress_mask_pair");
+                    ggml_tensor * bucket_mask = pair_gather
+                        ? get_dsv4_inputs()->add_mask(ctx0, dsv4_mask_kind::COMPRESS_BUCKET,
+                                nc_idx, n_tokens, 0, n_comp_cache - 1, DSV4_CS_BUCKET, compress_ratio,
+                                "dsv4_idx_score_bucket_mask_pair")
+                        : nullptr;
+                    ggml_tensor * raw_mask_pair = inp_attn->get_kq_mask_swa();
+                    ggml_tensor * k_raw_pair = mctx_swa->get_k(ctx0, il);
+                    k_raw_pair = ggml_reshape_3d(ctx0, k_raw_pair, n_embd_head_k, 1, k_raw_pair->ne[2]);
+
+                    ggml_tensor * cur_c[2], * qr_c[2], * q_c[2], * pos_c[2];
+                    ggml_tensor * attn_read = nullptr, * index_read = nullptr;
+                    for (int t = 0; t < 2; ++t) {
+                        const int64_t off = (int64_t) t - 1;
+                        cur_c[t] = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, n_embd, 1,
+                                cur->nb[1], (size_t) t * cur->nb[1]));
+                        qr_c[t]  = ggml_cont(ctx0, ggml_view_2d(ctx0, qr, qr->ne[0], 1,
+                                qr->nb[1], (size_t) t * qr->nb[1]));
+                        q_c[t]   = ggml_cont(ctx0, ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], 1,
+                                q->nb[1], q->nb[2], (size_t) t * q->nb[2]));
+                        pos_c[t] = ggml_view_1d(ctx0, inp_pos, 1, (size_t) t * sizeof(int32_t));
+
+                        char nb0[96];
+                        auto nm = [&](const char * s) -> const char * {
+                            snprintf(nb0, sizeof(nb0), "%s_p%d", s, t);
+                            return nb0;
+                        };
+                        ggml_tensor * ape_i  = get_dsv4_inputs()->add_index(ctx0, compress_ratio, 0, nm("dsv4_attn_ape_idx"), off);
+                        ggml_tensor * row_i  = get_dsv4_inputs()->add_index(ctx0, compress_ratio, compress_ratio, nm("dsv4_attn_row_idx"), off);
+                        ggml_tensor * cpos_i = get_dsv4_inputs()->add_comp_pos_index(ctx0, compress_ratio, nm("dsv4_cs_comp_pos"), off);
+                        ggml_tensor * bnd_i  = get_dsv4_inputs()->add_boundary_flag(ctx0, compress_ratio, nm("dsv4_cs_boundary"), off);
+                        ggml_tensor * crow_i = get_dsv4_inputs()->add_comp_row_index(ctx0, compress_ratio, n_comp_cache - 1, nm("dsv4_cs_comp_row"), off);
+
+                        dsv4_decode_compressor dec_t = dsv4_build_compressor_decode(ctx0, cur_c[t],
+                                prev_akv, prev_asc,
+                                layer.attn_compressor_kv,
+                                layer.attn_compressor_gate,
+                                layer.attn_compressor_ape,
+                                layer.attn_compressor_norm,
+                                n_embd_head_k, n_rot,
+                                first_pos + t, compress_ratio, rope_type, rope_cfg, norm_rms_eps,
+                                ape_i, row_i, cpos_i, bnd_i);
+                        prev_akv = dec_t.kv_state;
+                        prev_asc = dec_t.score_state;
+                        if (dec_t.kv_comp != nullptr) {
+                            ggml_tensor * kvq = ggml_dsv4_fp8_kv_quantize(ctx0, dec_t.kv_comp, n_rot);
+                            attn_read = store_attn_cache_rows(kvq, n_comp_before,
+                                    n_comp_visible - n_comp_before, crow_i);
+                        }
+
+                        ggml_tensor * iape_i = get_dsv4_inputs()->add_index(ctx0, compress_ratio, 0, nm("dsv4_idx_ape_idx"), off);
+                        ggml_tensor * irow_i = get_dsv4_inputs()->add_index(ctx0, compress_ratio, compress_ratio, nm("dsv4_idx_row_idx"), off);
+                        dsv4_decode_compressor idec_t = dsv4_build_compressor_decode(ctx0, cur_c[t],
+                                prev_ikv, prev_isc,
+                                layer.indexer_compressor_kv,
+                                layer.indexer_compressor_gate,
+                                layer.indexer_compressor_ape,
+                                layer.indexer_compressor_norm,
+                                hparams.indexer_head_size, n_rot,
+                                first_pos + t, compress_ratio, rope_type, rope_cfg, norm_rms_eps,
+                                iape_i, irow_i, cpos_i, bnd_i);
+                        prev_ikv = idec_t.kv_state;
+                        prev_isc = idec_t.score_state;
+                        if (idec_t.kv_comp != nullptr) {
+                            index_read = store_index_cache_rows(idec_t.kv_comp, n_comp_before,
+                                    n_comp_visible - n_comp_before, crow_i);
+                        }
+                    }
+
+                    // chained states after token 1 are the layer's new state
+                    dsv4_store_state_segment(ctx0, gf, prev_akv, inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, 0);
+                    dsv4_store_state_segment(ctx0, gf, prev_asc, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, 0);
+                    dsv4_store_state_segment(ctx0, gf, prev_ikv, inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, attn_state_layout.elems);
+                    dsv4_store_state_segment(ctx0, gf, prev_isc, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, attn_state_layout.elems);
+
+                    if (attn_read == nullptr) {
+                        attn_read = mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id);
+                    }
+                    if (index_read == nullptr) {
+                        index_read = mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id);
+                    }
+
+                    // scorer + attention per token; reads ordered after BOTH
+                    // stores (attn_read/index_read are the post-store views of
+                    // the second store; earlier-token invisibility is enforced
+                    // by the per-row masks, so seeing the newer row is safe).
+                    ggml_tensor * outs[2] = { nullptr, nullptr };
+                    for (int t = 0; t < 2; ++t) {
+                        ggml_tensor * k_all_t = nullptr;
+                        ggml_tensor * comp_mask_t = nullptr;
+                        if (pair_gather) {
+                            ggml_tensor * index_cache = dsv4_cache_view_3d(ctx0, index_read, nc_idx);
+                            index_cache = ggml_reshape_2d(ctx0, index_cache, hparams.indexer_head_size, nc_idx);
+                            ggml_tensor * scores_t = dsv4_build_indexer_scores_decode(ctx0,
+                                    cur_c[t], qr_c[t], index_cache,
+                                    layer.indexer_attn_q_b,
+                                    layer.indexer_proj,
+                                    pos_c[t],
+                                    hparams.indexer_n_head,
+                                    hparams.indexer_head_size,
+                                    nc_idx, n_rot, rope_type, rope_cfg);
+                            ggml_tensor * bmask_t = ggml_view_2d(ctx0, bucket_mask, nc_idx, 1,
+                                    bucket_mask->nb[1], (size_t) t * bucket_mask->nb[1]);
+                            scores_t = ggml_add(ctx0, scores_t, bmask_t);
+                            ggml_tensor * topk = ggml_argsort_top_k(ctx0, scores_t, top_k);
+                            topk = ggml_reshape_1d(ctx0, topk, top_k);
+                            ggml_tensor * comp_rows = ggml_view_2d(ctx0, attn_read,
+                                    attn_read->ne[0], nc_idx, attn_read->nb[1], 0);
+                            ggml_tensor * kv_sel = ggml_get_rows(ctx0, comp_rows, topk);
+                            kv_sel = ggml_cast(ctx0, kv_sel, GGML_TYPE_F16);
+                            kv_sel = ggml_reshape_3d(ctx0, kv_sel, attn_read->ne[0], 1, top_k);
+                            k_all_t = ccat(k_raw_pair, kv_sel, 2, "gather-k");
+                            comp_mask_t = dsv4_new_filled_2d(ctx0, top_k, 1, 0.0f);
+                        } else {
+                            ggml_tensor * kv_comp_cache = dsv4_cache_view_3d(ctx0, attn_read, cs_nc_fixed);
+                            k_all_t = ccat(k_raw_pair, kv_comp_cache, 2, "fixed-k");
+                            comp_mask_t = ggml_view_2d(ctx0, fixed_mask, cs_nc_fixed, 1,
+                                    fixed_mask->nb[1], (size_t) t * fixed_mask->nb[1]);
+                        }
+                        ggml_tensor * mask_t = ggml_view_2d(ctx0, raw_mask_pair,
+                                raw_mask_pair->ne[0], 1, raw_mask_pair->nb[1],
+                                (size_t) t * raw_mask_pair->nb[1]);
+                        if (mask_t->type != GGML_TYPE_F32) {
+                            // get_kq_mask_swa() is F16 under flash-attn; our comp
+                            // masks are F32 inputs — unify on F32, final cast below
+                            mask_t = ggml_cast(ctx0, mask_t, GGML_TYPE_F32);
+                        }
+                        mask_t = ccat(mask_t, comp_mask_t, 0, "mask");
+                        ggml_tensor * v_all_t = k_all_t;
+                        if (cparams.flash_attn) {
+                            dsv4_pad_fattn_width(ctx0, &k_all_t, &mask_t);
+                            v_all_t = k_all_t;
+                        }
+                        ggml_tensor * mask_cnv_t = cparams.flash_attn
+                            ? ggml_cast(ctx0, mask_t, GGML_TYPE_F16) : mask_t;
+                        outs[t] = build_attn_mha(q_c[t], k_all_t, v_all_t, nullptr, mask_cnv_t,
+                                layer.attn_sinks, nullptr, nullptr, kq_scale, il);
+                    }
+                    cs_pair_out = ccat(outs[0], outs[1], 1, "outs");
+                    cb(cs_pair_out, "kqv_out_pair", il);
+                } else {
+                // ---- legacy single-token / generic multi-token decode ----
 
                 ggml_tensor * attn_ape_idx = n_tokens == 1
                     ? get_dsv4_inputs()->add_index(ctx0, compress_ratio, 0, "dsv4_attn_ape_idx") : nullptr;
@@ -2547,8 +2757,13 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
                     attn_mask = ggml_concat(ctx0, attn_mask, comp_mask, 0);
                 }
+                } // end legacy (non-cs_pair) decode path
             }
 
+            if (cs_pair_out != nullptr) {
+                cur = cs_pair_out;
+                cb(cur, "kqv_out", il);
+            } else {
             if (cparams.flash_attn && k_all == v_all) {
                 // Keep the FA width a multiple of 256 so the CUDA kernel for
                 // head 512 accepts it (else silent CPU fallback, see helper).
@@ -2558,6 +2773,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             ggml_tensor * attn_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, attn_mask, GGML_TYPE_F16) : attn_mask;
             cur = build_attn_mha(q, k_all, v_all, nullptr, attn_mask_cnv, layer.attn_sinks, nullptr, nullptr, kq_scale, il);
             cb(cur, "kqv_out", il);
+            }
         }
         cur = ggml_reshape_3d(ctx0, cur, n_embd_head_v, n_head, n_tokens);
         cur = dsv4_apply_rope_tail(ctx0, cur, inp_pos,
@@ -2785,7 +3001,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 spec_rope.ext_factor, spec_rope.attn_factor, spec_rope.beta_fast, spec_rope.beta_slow, false);
         ikv = ggml_dsv4_fp8_kv_quantize(ctx0, ikv, n_rot);
         mtp_spec_kv_local = ikv;
-        if (mtp.ensure_ring(ikv->type, ikv->ne[0])) {
+        if (mtp.ensure_ring(ikv->type, ikv->ne[0], n_embd, n_hc)) {
             ggml_tensor * rows = di->add_mtp_ring_rows(ctx0, nt, DSV4_MTP_RING);
             ggml_tensor * kv2d = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ikv), ikv->ne[0], nt);
             ggml_tensor * updated = ggml_set_rows(ctx0, mtp.ring_kv, kv2d, rows);
@@ -2800,18 +3016,23 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         inpL = ggml_reshape_3d(ctx0, inpL, n_embd, n_hc, n_outputs);
     }
 
-    // MTP spec: expose the final HC of the last <=2 output positions. The
-    // client reads this via cb_eval and feeds the right column back as the
-    // next batch's mtp_seed_in (picking column 0 after a draft reject).
-    if (mtp_spec && (inp_out_ids ? n_outputs : n_tokens) >= 1) {
+    // MTP spec: expose the final HC of the last <=2 output positions into the
+    // static hout buffer (read post-decode via dsv4_mtp_spec_read_hist; the
+    // client feeds the right column back as the next batch's mtp_seed_in,
+    // picking column 0 after a draft reject). Static copies instead of
+    // cb_eval outputs: no mid-graph observation splits / syncs.
+    if (mtp_spec && dsv4_mtp_get().hout != nullptr &&
+        (inp_out_ids ? n_outputs : n_tokens) >= 1) {
+        dsv4_mtp_module & mtp = dsv4_mtp_get();
         const int64_t n_out_hc = inp_out_ids ? n_outputs : n_tokens;
         const int64_t nh = std::min<int64_t>(n_out_hc, 2);
         ggml_tensor * hist = ggml_view_3d(ctx0, inpL, n_embd, n_hc, nh,
                 inpL->nb[1], inpL->nb[2], (n_out_hc - nh) * inpL->nb[2]);
         hist = ggml_cont(ctx0, hist);
         ggml_set_name(hist, "mtp_hc_hist");
-        ggml_set_output(hist);
-        ggml_build_forward_expand(gf, hist);
+        hist = ggml_reshape_1d(ctx0, hist, n_embd * n_hc * nh);
+        ggml_tensor * hview = ggml_view_1d(ctx0, mtp.hout, n_embd * n_hc * nh, 0);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, hist, hview));
     }
 
     ggml_tensor * cur = dsv4_hc_head(ctx0, inpL,
@@ -2957,8 +3178,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         ccur = ggml_mul_mat(ctx0, model.output, ccur);                          // [n_vocab, nc]
         ggml_tensor * cdraft = ggml_argmax(ctx0, ccur);                         // i32 [nc]
         ggml_set_name(cdraft, "mtp_spec_draft");
-        ggml_set_output(cdraft);
-        ggml_build_forward_expand(gf, cdraft);
+        ggml_tensor * cdraft_f = ggml_cast(ctx0, cdraft, GGML_TYPE_F32);
+        ggml_tensor * dview = ggml_view_1d(ctx0, mtp.dout, nc, 0);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, cdraft_f, dview));
     }
 }
 
@@ -2992,6 +3214,37 @@ extern "C" void dsv4_mtp_spec_set_seed(const float * hc, int64_t n) {
     m.hc_seed_cpu.assign(hc, hc + n);
 }
 
+// n_embd*n_hc (one hc_hist column), 0 until the first spec graph was built.
+extern "C" int64_t dsv4_mtp_spec_hc_elems(void) {
+    return dsv4_mtp_get().hc_elems;
+}
+
+// Read the last decode's draft tokens / hc_hist from the static buffers.
+// Call AFTER llama_decode returned; n is clamped to what fits.
+extern "C" bool dsv4_mtp_spec_read_draft(int32_t * out, int32_t n) {
+    dsv4_mtp_module & m = dsv4_mtp_get();
+    if (m.dout == nullptr || out == nullptr || n <= 0) {
+        return false;
+    }
+    if (n > 2) n = 2;
+    float tmp[2] = { 0.0f, 0.0f };
+    ggml_backend_tensor_get(m.dout, tmp, 0, (size_t) n * sizeof(float));
+    for (int32_t i = 0; i < n; ++i) {
+        out[i] = (int32_t) lroundf(tmp[i]);
+    }
+    return true;
+}
+
+extern "C" bool dsv4_mtp_spec_read_hist(float * out, int64_t n) {
+    dsv4_mtp_module & m = dsv4_mtp_get();
+    if (m.hout == nullptr || out == nullptr || n <= 0) {
+        return false;
+    }
+    if (n > m.hc_elems * 2) n = m.hc_elems * 2;
+    ggml_backend_tensor_get(m.hout, out, 0, (size_t) n * sizeof(float));
+    return true;
+}
+
 // Rewind position p0 (a rejected draft) out of the caches. Legal ONLY when p0
 // did not close a compression chunk (the client gates speculation so that
 // (p0+1) % ratio != 0 for every compressed ratio): between boundaries the
@@ -3006,5 +3259,62 @@ extern "C" bool dsv4_mtp_spec_rollback(llama_memory_t mem, int32_t seq_id, int32
         return false;
     }
     hyb->get_mem_recr()->seq_add(seq_id, p0, p0 + 1, -1);
+    return true;
+}
+
+// Shadow copies of the recurrent compressor states (r_l/s_l), one per layer on
+// the SAME device (DtoD copies, ~us each). Lets the client speculate ACROSS
+// chunk boundaries: save before a boundary-crossing verify, restore on reject.
+// Off-boundary verifies need neither (state never advances between boundaries).
+extern "C" bool dsv4_mtp_state_shadow(llama_memory_t mem, int32_t n_layer, int32_t op) {
+    auto * hyb = dynamic_cast<llama_memory_hybrid_iswa *>(mem);
+    if (hyb == nullptr) {
+        return false;
+    }
+    llama_memory_recurrent * recr = hyb->get_mem_recr();
+    if (recr == nullptr) {
+        return false;
+    }
+    static std::vector<ggml_context *>          sctx;
+    static std::vector<ggml_backend_buffer_t>   sbuf;
+    static std::vector<ggml_tensor *> sr, ss;   // shadows
+    static std::vector<ggml_tensor *> pr, ps;   // originals
+    if (sr.empty()) {
+        for (int32_t il = 0; il < n_layer; ++il) {
+            ggml_tensor * r = il < (int32_t) recr->r_l.size() ? recr->r_l[il] : nullptr;
+            ggml_tensor * s = il < (int32_t) recr->s_l.size() ? recr->s_l[il] : nullptr;
+            if (r == nullptr || s == nullptr || r->buffer == nullptr) {
+                pr.push_back(nullptr); ps.push_back(nullptr);
+                sr.push_back(nullptr); ss.push_back(nullptr);
+                continue;
+            }
+            ggml_init_params ip = { 4 * ggml_tensor_overhead(), nullptr, /*no_alloc*/ true };
+            ggml_context * c = ggml_init(ip);
+            ggml_tensor * rsh = ggml_dup_tensor(c, r);
+            ggml_tensor * ssh = ggml_dup_tensor(c, s);
+            ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors_from_buft(c,
+                    ggml_backend_buffer_get_type(r->buffer));
+            if (b == nullptr) {
+                fprintf(stderr, "dsv4-mtp: state shadow alloc failed at layer %d\n", il);
+                return false;
+            }
+            sctx.push_back(c); sbuf.push_back(b);
+            pr.push_back(r); ps.push_back(s); sr.push_back(rsh); ss.push_back(ssh);
+        }
+        fprintf(stderr, "dsv4-mtp: state shadows ready (%d layers)\n", n_layer);
+    }
+    if (op == 1) {          // save
+        for (size_t i = 0; i < pr.size(); ++i) {
+            if (pr[i] == nullptr) continue;
+            ggml_backend_tensor_copy(pr[i], sr[i]);
+            ggml_backend_tensor_copy(ps[i], ss[i]);
+        }
+    } else if (op == 2) {   // restore
+        for (size_t i = 0; i < pr.size(); ++i) {
+            if (pr[i] == nullptr) continue;
+            ggml_backend_tensor_copy(sr[i], pr[i]);
+            ggml_backend_tensor_copy(ss[i], ps[i]);
+        }
+    }
     return true;
 }
