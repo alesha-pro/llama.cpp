@@ -1800,7 +1800,9 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     const int nwarps         = nthreads / warp_size_host;
 
     constexpr bool V_is_K_view = DKQ == 576; // Guaranteed by the kernel selection logic in fattn.cu
-    constexpr bool may_use_top_k = DKQ == 576 && ncols1 == 1; // limit kernel top_k code bloat to this one case
+    // limit kernel top_k code bloat to these cases:
+    //   576 = DeepSeek V3.2 DSA, 512 = DeepSeek V4 NSA ratio-4 prompt chunks
+    constexpr bool may_use_top_k = (DKQ == 576 || DKQ == 512) && ncols1 == 1;
 
     const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(nbatch_K2 + 4,  nbatch_V2 + 4) * sizeof(half2);
     const size_t nbytes_shared_KV_2stage = nbatch_fa            *         (nbatch_K2 + 4 + nbatch_V2 + 4) * sizeof(half2);

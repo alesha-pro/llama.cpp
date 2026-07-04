@@ -28,6 +28,21 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         }
     }
 
+    // DeepSeek V4 NSA prompt chunks: head 512 lands here with ncols2 == 8 via
+    // the GQA opt; force the same single-token Q tiling for the top-k path
+    if constexpr (ncols2 == 8 && DKQ == 512) {
+        if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_top_k(ctx, dst)) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                fprintf(stderr, "%s: engaging sparse top-k FA for DKQ=512 (n_top_k=%lld, K=%lld)\n",
+                        __func__, (long long) dst->src[5]->ne[0], (long long) dst->src[1]->ne[1]);
+            }
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, ncols2>(ctx, dst);
+            return;
+        }
+    }
+
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);

@@ -273,6 +273,21 @@ static bool dsv4_topk_gather_disabled() {
 // the decode graph replays in between instead of recapturing every boundary.
 static constexpr int64_t DSV4_CS_BUCKET = 2048;
 
+// Sparse top-k FA for ratio-4 prompt chunks (env DSV4_SPARSE_FA=1): instead of
+// masking the FULL compressed width (dense FA cost grows linearly with depth,
+// the dominant quadratic term of long prefills), pass a per-token index list
+// [all raw rows ++ n_raw + comp top-k] into the DSA top-k FA kernel - the
+// kernel then iterates only those rows and reads the mask through the indices.
+// DSV4_SPARSE_FA=2 builds the FULL index list (same attended set as the dense
+// path) - a correctness A/B mode, no speedup.
+static int dsv4_sparse_fa_mode() {
+    static const int v = [] {
+        const char * e = getenv("DSV4_SPARSE_FA");
+        return e == nullptr ? 0 : atoi(e);
+    }();
+    return v;
+}
+
 // GPU-built masks for the multi-token (prompt-chunk) paths. The CPU input
 // masks cost an O(width x n_tokens) -INF fill + PCIe upload per ubatch (the
 // dominant CPU-side quadratic term of long prefills: at 200K ctx the indexer
@@ -2273,6 +2288,10 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             // tail is skipped.
             ggml_tensor * cs_pair_out = nullptr;
 
+            // set by the sparse top-k FA prompt-chunk path (DSV4_SPARSE_FA):
+            // per-token int32 index list handed to flash-attn as src[5]
+            ggml_tensor * sparse_topk = nullptr;
+
             if (!is_prefill) {
                 const llama_pos first_pos = ubatch.pos ? ubatch.pos[0] : 0;
                 const llama_pos last_pos  = ubatch.pos ? ubatch.pos[n_tokens - 1] : n_tokens - 1;
@@ -2789,7 +2808,72 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                 ggml_tensor * topk = ggml_argsort_top_k(ctx0, index_scores, top_k);
                                 cb(topk, "indexer_topk", il);
 
-                                comp_mask = dsv4_build_compressed_mask_from_topk(ctx0, index_scores, topk);
+                                // Sparse top-k FA (prompt chunks): the FA kernel's
+                                // DSA path iterates only the listed rows and reads
+                                // the mask THROUGH the indices, so the comp mask
+                                // can stay plain-causal. The kernel engages only
+                                // at K width >= 8192 (fattn.cu gate) - mirror it
+                                // exactly, because the dense kernel would IGNORE
+                                // the index list and a causal comp mask would then
+                                // silently widen the attended set beyond top-k.
+                                const int64_t n_raw_rows = k_raw->ne[2];
+                                const int64_t fa_width   = n_raw_rows + n_comp_visible;
+                                const int64_t fa_wpad    = GGML_PAD(fa_width, 256);
+                                const int     sfa        = dsv4_sparse_fa_mode();
+                                const int64_t n_sel      = sfa == 2 ? fa_width : n_raw_rows + top_k;
+                                // list length must be %32 (the kernel's OOB tail
+                                // slots read mask 0.0, not -INF); pad slots point
+                                // at the first fattn pad row (mask -INF for every
+                                // query) - only available when the width pads
+                                const bool sel_padded_ok = n_sel % 32 == 0 || fa_wpad > fa_width;
+                                const bool sparse_fa = sfa > 0 && n_tokens > 1
+                                    && cparams.flash_attn
+                                    && fa_wpad >= 8192
+                                    && sel_padded_ok;
+                                if (sparse_fa) {
+                                    if (!dsv4_gpu_masks_disabled()) {
+                                        get_dsv4_inputs()->note_comp_width(compress_ratio, n_comp_visible);
+                                        comp_mask = get_gpu_comp_mask(n_comp_visible, compress_ratio);
+                                    } else {
+                                        comp_mask = get_dsv4_inputs()->add_mask(ctx0,
+                                                dsv4_mask_kind::COMPRESS_CAUSAL,
+                                                n_comp_visible, n_tokens,
+                                                0, n_comp_visible, 0, compress_ratio,
+                                                "dsv4_attn_compress_mask");
+                                    }
+
+                                    ggml_tensor * idx_f;
+                                    if (sfa == 2) {
+                                        // FULL list: identical attended set to the
+                                        // dense path - correctness A/B, no speedup
+                                        idx_f = ggml_arange(ctx0, 0.0f, (float) fa_width, 1.0f);
+                                        idx_f = ggml_repeat_4d(ctx0, ggml_reshape_2d(ctx0, idx_f, fa_width, 1),
+                                                fa_width, n_tokens, 1, 1);
+                                    } else {
+                                        // [all raw rows ++ n_raw + comp top-k]; the
+                                        // raw/SWA visibility is enforced by the raw
+                                        // mask read through the indices, and the
+                                        // comp top-k picks are causally valid by
+                                        // construction (causal mask was added to
+                                        // the indexer scores before argsort)
+                                        ggml_tensor * raw_f = ggml_arange(ctx0, 0.0f, (float) n_raw_rows, 1.0f);
+                                        raw_f = ggml_repeat_4d(ctx0, ggml_reshape_2d(ctx0, raw_f, n_raw_rows, 1),
+                                                n_raw_rows, n_tokens, 1, 1);
+                                        ggml_tensor * comp_f = ggml_cast(ctx0, topk, GGML_TYPE_F32);
+                                        comp_f = dsv4_add_scalar(ctx0, comp_f, (float) n_raw_rows);
+                                        idx_f = ggml_concat(ctx0, raw_f, comp_f, 0);
+                                    }
+                                    const int64_t n_sel_pad = GGML_PAD(idx_f->ne[0], 32);
+                                    if (n_sel_pad != idx_f->ne[0]) {
+                                        ggml_tensor * padf = dsv4_new_filled_2d(ctx0,
+                                                n_sel_pad - idx_f->ne[0], n_tokens, (float) fa_width);
+                                        idx_f = ggml_concat(ctx0, idx_f, padf, 0);
+                                    }
+                                    sparse_topk = ggml_cast(ctx0, idx_f, GGML_TYPE_I32);
+                                    cb(sparse_topk, "dsv4_sparse_fa_topk", il);
+                                } else {
+                                    comp_mask = dsv4_build_compressed_mask_from_topk(ctx0, index_scores, topk);
+                                }
                             }
                         }
                     } else {
@@ -2823,7 +2907,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 v_all = k_all;
             }
             ggml_tensor * attn_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, attn_mask, GGML_TYPE_F16) : attn_mask;
-            cur = build_attn_mha(q, k_all, v_all, nullptr, attn_mask_cnv, layer.attn_sinks, nullptr, nullptr, kq_scale, il);
+            cur = build_attn_mha(q, k_all, v_all, nullptr, attn_mask_cnv, layer.attn_sinks, nullptr, sparse_topk, kq_scale, il);
             cb(cur, "kqv_out", il);
             }
         }
