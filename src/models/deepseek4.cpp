@@ -1876,6 +1876,18 @@ struct dsv4_mtp_module {
     int64_t   ring_pos_cpu[DSV4_MTP_RING];    // abs position per row, -1 empty
     std::vector<float> hc_seed_cpu;           // [n_embd*n_hc] HC of the token before the batch
 
+    // Device-resident mirror of the base model's token embedding (lazy).
+    // get_rows(tok_embd, argmax-i32) with the host-buffer embedding lands on
+    // CPU and drags the i32 draft id through a cross-backend copy that is
+    // unreliable in this build (stale/garbage id -> OOB row assert; hit on
+    // genuine decode after a checkpoint restore, not just the prefill
+    // boundary that 859e602 gated off). Mirroring the embedding onto the MTP
+    // device keeps the whole candidate lookup on-GPU.
+    ggml_context         * ectx = nullptr;
+    ggml_backend_buffer_t  ebuf = nullptr;
+    ggml_tensor          * tok_embd_dev = nullptr;
+    bool embd_attempted = false;
+
     ggml_tensor * t(const char * name) const {
         auto it = tensors.find(name);
         GGML_ASSERT(it != tensors.end() && "dsv4-mtp: missing tensor");
@@ -1914,6 +1926,45 @@ struct dsv4_mtp_module {
             ring_pos_cpu[i] = -1;
         }
         return true;
+    }
+
+    // Device mirror of the token embedding, or nullptr (caller falls back to
+    // the host tensor). One-shot: an alloc failure is not retried.
+    ggml_tensor * ensure_tok_embd(ggml_tensor * src) {
+        if (embd_attempted) {
+            return tok_embd_dev;
+        }
+        embd_attempted = true;
+        if (src == nullptr || wbuft == nullptr) {
+            return nullptr;
+        }
+        if (src->buffer == nullptr || src->data == nullptr) {
+            // memory-estimation pass builds graphs before weights are loaded;
+            // retry once the real tensor data exists
+            embd_attempted = false;
+            return nullptr;
+        }
+        ggml_init_params ep = { 2 * ggml_tensor_overhead(), nullptr, /*no_alloc*/ true };
+        ectx = ggml_init(ep);
+        ggml_tensor * dst = ggml_dup_tensor(ectx, src);
+        ggml_set_name(dst, "dsv4_mtp_tok_embd_dev");
+        ebuf = ggml_backend_alloc_ctx_tensors_from_buft(ectx, wbuft);
+        if (ebuf == nullptr) {
+            fprintf(stderr, "dsv4-mtp: tok_embd device mirror alloc failed, keeping host path\n");
+            return nullptr;
+        }
+        ggml_backend_buffer_set_usage(ebuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        const size_t nb   = ggml_nbytes(src);
+        const size_t step = 64ull * 1024 * 1024;
+        std::vector<uint8_t> tmp(nb < step ? nb : step);
+        for (size_t off = 0; off < nb; off += step) {
+            const size_t n = nb - off < step ? nb - off : step;
+            ggml_backend_tensor_get(src, tmp.data(), off, n);
+            ggml_backend_tensor_set(dst, tmp.data(), off, n);
+        }
+        tok_embd_dev = dst;
+        fprintf(stderr, "dsv4-mtp: token embedding mirrored onto MTP device (%zu MiB)\n", nb >> 20);
+        return dst;
     }
 };
 
@@ -3228,7 +3279,11 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         ggml_tensor * lg_tail = ggml_view_2d(ctx0, cur, cur->ne[0], nc,
                 cur->nb[1], (n_out - nc) * cur->nb[1]);
         ggml_tensor * cand_tok = ggml_argmax(ctx0, lg_tail);                    // i32 [nc]
-        ggml_tensor * cand_emb = ggml_get_rows(ctx0, model.tok_embd, cand_tok); // [n_embd, nc]
+        ggml_tensor * embd_src = mtp.ensure_tok_embd(model.tok_embd);
+        if (embd_src == nullptr) {
+            embd_src = model.tok_embd;
+        }
+        ggml_tensor * cand_emb = ggml_get_rows(ctx0, embd_src, cand_tok);       // [n_embd, nc]
 
         ggml_tensor * hc_tail = ggml_view_3d(ctx0, inpL, n_embd, n_hc, nc,
                 inpL->nb[1], inpL->nb[2], (n_out - nc) * inpL->nb[2]);
@@ -3347,7 +3402,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             ggml_tensor * hc1 = ggml_view_3d(ctx0, chc, n_embd, n_hc, 1,
                     chc->nb[1], chc->nb[2], (size_t)(nc - 1) * chc->nb[2]);
             ggml_tensor * d1_last = ggml_view_1d(ctx0, cdraft, 1, (size_t)(nc - 1) * cdraft->nb[0]);
-            ggml_tensor * e2 = ggml_get_rows(ctx0, model.tok_embd, d1_last);    // [n_embd, 1]
+            ggml_tensor * e2 = ggml_get_rows(ctx0, embd_src, d1_last);          // [n_embd, 1]
             ggml_tensor * h2 = ggml_rms_norm(ctx0, hc1, norm_rms_eps);
             h2 = ggml_mul(ctx0, h2, mtp.t("mtp.0.hnorm.weight"));
             h2 = ggml_mul_mat(ctx0, mtp.t("mtp.0.h_proj.weight"), h2);
