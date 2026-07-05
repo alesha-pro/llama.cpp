@@ -1944,11 +1944,24 @@ struct dsv4_mtp_module {
             embd_attempted = false;
             return nullptr;
         }
+        // DSV4_MTP_EMBD_DEV moves the ~1 GiB mirror off the MTP device (VRAM
+        // valve): the get_rows node follows the weight, its i32 index and the
+        // resulting embedding travel device-to-device, which is the reliable
+        // path (only the CPU-backend hop was flaky).
+        ggml_backend_buffer_type_t ebuft = wbuft;
+        if (const char * edev = getenv("DSV4_MTP_EMBD_DEV")) {
+            ggml_backend_dev_t dev = ggml_backend_dev_by_name(edev);
+            if (dev != nullptr) {
+                ebuft = ggml_backend_dev_buffer_type(dev);
+            } else {
+                fprintf(stderr, "dsv4-mtp: DSV4_MTP_EMBD_DEV=%s not found, using MTP device\n", edev);
+            }
+        }
         ggml_init_params ep = { 2 * ggml_tensor_overhead(), nullptr, /*no_alloc*/ true };
         ectx = ggml_init(ep);
         ggml_tensor * dst = ggml_dup_tensor(ectx, src);
         ggml_set_name(dst, "dsv4_mtp_tok_embd_dev");
-        ebuf = ggml_backend_alloc_ctx_tensors_from_buft(ectx, wbuft);
+        ebuf = ggml_backend_alloc_ctx_tensors_from_buft(ectx, ebuft);
         if (ebuf == nullptr) {
             fprintf(stderr, "dsv4-mtp: tok_embd device mirror alloc failed, keeping host path\n");
             return nullptr;
