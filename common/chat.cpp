@@ -1820,8 +1820,13 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
             parser.build_grammar(builder, data.grammar_lazy);
         });
 
+        // Trigger on the DSML prefix rather than the full tool_calls tag: the
+        // grammar then activates at the first DSML token and forces the
+        // correct tag spelling. At temp>0 the Q2 model occasionally emitted
+        // <DSML>tool_invoke>, which a full-tag trigger (and the PEG parser)
+        // silently let through as plain content.
         data.grammar_triggers = {
-            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, FC_START },
+            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<" + DSML },
         };
     }
 

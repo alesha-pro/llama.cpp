@@ -15,6 +15,19 @@
 using json = nlohmann::ordered_json;
 
 static std::string build_repetition(const std::string & item_rule, int min_items, int max_items, const std::string & separator_rule = "") {
+    // llama-grammar expands {m,n} into n chained rule copies and rejects the
+    // whole grammar once an expansion reaches MAX_REPETITION_THRESHOLD (2000).
+    // A single tool schema with e.g. maxLength >= 2000 (Firecrawl
+    // search_feedback) therefore killed the entire lazy tool grammar and left
+    // sampling unconstrained. Wide bounds add no useful constraint; treat
+    // them as unbounded (and cap huge minimums) so the grammar always builds.
+    static const int REP_CAP = 256;
+    if (max_items != std::numeric_limits<int>::max() && max_items > REP_CAP) {
+        max_items = std::numeric_limits<int>::max();
+    }
+    if (min_items > REP_CAP) {
+        min_items = REP_CAP;
+    }
     auto has_max = max_items != std::numeric_limits<int>::max();
 
     if (max_items == 0) {
