@@ -2,6 +2,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "unary.cuh"
 
 #include <algorithm>
 #include <vector>
@@ -260,6 +261,143 @@ void ggml_cuda_mul_mat_q(
         use_stream_k, ncols_max};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+}
+
+// DSV4_MOE_FUSE: fused up+gate for the MUL_MAT_ID prefill path. Shares the
+// token->expert grouping, the q8_1 activation quantization and the
+// DSV4_MOE_TILE ncols_max readback between the two matmuls, then applies the
+// SWIGLU_CLAMP epilogue. The two weight matrices must have identical type,
+// shape and strides (checked by ggml_cuda_should_fuse_mul_mat).
+void ggml_cuda_mul_mat_q_fused_up_gate(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * glu_dst) {
+
+    const ggml_tensor * src1 = up->src[1];
+    const ggml_tensor * ids  = up->src[2];
+
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids != nullptr && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(gate->src[1] == src1);
+    GGML_ASSERT(gate->src[2] == ids);
+    GGML_ASSERT(up->src[0]->type == gate->src[0]->type);
+    GGML_ASSERT(up->type == GGML_TYPE_F32 && gate->type == GGML_TYPE_F32);
+
+    cudaStream_t stream = ctx.stream();
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    const size_t ts_src1 = ggml_type_size(src1->type);
+
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    const int64_t ne13 = src1->ne[3];
+    GGML_ASSERT(ne13 == 1);
+    GGML_ASSERT(src1->nb[2] % src1->nb[1] == 0);
+
+    const int64_t ne02 = up->src[0]->ne[2]; // n_expert
+
+    const int64_t ne10_padded   = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t ne_get_rows   = ne12 * n_expert_used;
+
+    const bool use_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
+                            || GGML_CUDA_CC_IS_CDNA(cc);
+
+    // shared: token->expert grouping
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
+
+    {
+        GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
+        const int si1  = ids->nb[1] / ggml_element_size(ids);
+        const int sis1 = src1->nb[2] / src1->nb[1];
+
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+            ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // shared: q8_1 activation quantization
+    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1)/QK8_1 +
+        get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+
+    {
+        const int64_t s11 = src1->nb[1] / ts_src1;
+        const int64_t s12 = src1->nb[2] / ts_src1;
+        const int64_t s13 = src1->nb[3] / ts_src1;
+
+        quantize_mmq_q8_1_cuda((const float *) src1->data, ids_src1.get(), src1_q8_1.get(), up->src[0]->type,
+                               ne10, s11, s12, s13, ne10_padded, ne12*n_expert_used, 1, 1, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    const int64_t s12q = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+    const int64_t s13q = ne12*s12q;
+
+    // shared: DSV4_MOE_TILE actual per-expert column bound (one readback for both)
+    int64_t ncols_max = ne_get_rows;
+    static const bool moe_tile = getenv("DSV4_MOE_TILE") != nullptr;
+    if (moe_tile && ne12 >= 64) {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &cap));
+        if (cap == cudaStreamCaptureStatusNone) {
+            std::vector<int32_t> eb(ne02 + 1);
+            CUDA_CHECK(cudaMemcpyAsync(eb.data(), expert_bounds.get(), (ne02 + 1)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            int32_t max_col_diff = 1;
+            for (int64_t i = 0; i < ne02; ++i) {
+                max_col_diff = std::max(max_col_diff, eb[i+1] - eb[i]);
+            }
+            ncols_max = max_col_diff;
+        }
+    }
+
+    // two mmq launches off the shared prep
+    for (int m = 0; m < 2; ++m) {
+        const ggml_tensor * node = m == 0 ? up : gate;
+        const ggml_tensor * src0 = node->src[0];
+
+        const size_t ts_src0 = ggml_type_size(src0->type);
+        const size_t ts_dst  = ggml_type_size(node->type);
+
+        // If src0 is a temporary compute buffer, clear any potential padding.
+        if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            const size_t size_data  = ggml_nbytes(src0);
+            const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
+            if (size_alloc > size_data) {
+                GGML_ASSERT(ggml_is_contiguously_allocated(src0));
+                GGML_ASSERT(!src0->view_src);
+                CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
+            }
+        }
+
+        const int64_t s01 = src0->nb[1] / ts_src0;
+        const int64_t s02 = src0->nb[2] / ts_src0;
+        const int64_t s03 = src0->nb[3] / ts_src0;
+        const int64_t s1  = node->nb[1] / ts_dst;
+        const int64_t s2  = node->nb[2] / ts_dst;
+        const int64_t s3  = node->nb[3] / ts_dst;
+
+        const mmq_args args = {
+            (const char *) src0->data, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), (float *) node->data,
+            src0->ne[0], src0->ne[1], ne_get_rows, s01, ne_get_rows, s1,
+            ne02, ne02, s02, s12q, s2,
+            src0->ne[3], ne13, s03, s13q, s3,
+            use_stream_k, ncols_max};
+
+        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+    }
+
+    // epilogue: silu(min(gate,limit)) * clamp(up,-limit,limit) -> glu_dst
+    ggml_cuda_op_swiglu_clamp(ctx, glu_dst);
+
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        fprintf(stderr, "%s: DSV4_MOE_FUSE=1 - fused up+gate MMQ engaged (ne12=%lld, ncols_max=%lld)\n",
+                __func__, (long long) ne12, (long long) ncols_max);
+    }
 }
 
 void ggml_cuda_op_mul_mat_q(

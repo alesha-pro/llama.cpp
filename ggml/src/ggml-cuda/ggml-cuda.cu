@@ -2428,7 +2428,9 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
             }
         }
     } else {
-        if (glu->src[0] != ffn_gate && glu->src[1] != ffn_up) {
+        const bool direct  = glu->src[0] == ffn_gate && glu->src[1] == ffn_up;
+        const bool crossed = glu->src[0] == ffn_up   && glu->src[1] == ffn_gate;
+        if (!direct && !crossed) {
             return false;
         }
     }
@@ -2446,7 +2448,7 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
-    static constexpr std::array<ggml_glu_op, 3> valid_glu_ops = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI };
+    static constexpr std::array<ggml_glu_op, 4> valid_glu_ops = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI, GGML_GLU_OP_SWIGLU_CLAMP };
 
     if (std::find(valid_glu_ops.begin(), valid_glu_ops.end(), ggml_get_glu_op(glu)) == valid_glu_ops.end()) {
         return false;
@@ -4189,7 +4191,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src1 = up->src[1];
             const ggml_tensor * ids  = up->src[2];
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
+            // SWIGLU_CLAMP has no epilogue in the vec kernels - keep decode on
+            // the unfused path and use the fused MMQ prefill path below.
+            const bool glu_is_swiglu_clamp = ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_CLAMP;
+
+            if (!glu_is_swiglu_clamp && ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
@@ -4200,12 +4206,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            if (!glu_is_swiglu_clamp && ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
 
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
+
+            // DSV4_MOE_FUSE=1: fused up+gate MMQ for the prefill ids path -
+            // shared ids grouping, q8_1 quantize and moe-tile readback, two
+            // mmq launches, swiglu_clamp epilogue. Batches <= 8 stay unfused.
+            static const bool dsv4_moe_fuse = getenv("DSV4_MOE_FUSE") != nullptr;
+            if (dsv4_moe_fuse && glu_is_swiglu_clamp &&
+                op == GGML_OP_MUL_MAT_ID && ids != nullptr &&
+                ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
+                src1->ne[2] > 8) {
+                ggml_cuda_mul_mat_q_fused_up_gate(*cuda_ctx, up, gate, glu);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
                 break;
