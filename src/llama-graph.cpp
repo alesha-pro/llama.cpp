@@ -1703,6 +1703,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 if (arch == LLM_ARCH_DEEPSEEK4 && il >= 0) {
                     const float limit = hparams.swiglu_clamp_exp[il];
                     constexpr float eps = 1e-6f;
+                    static const bool dsv4_glu_fuse = getenv("DSV4_GLU_FUSE") != nullptr;
+                    if (limit > eps && dsv4_glu_fuse) {
+                        cur = ggml_swiglu_clamp_split(ctx0, cur, up, limit);
+                        cb(cur, "ffn_moe_swiglu_clamped", il);
+                        break;
+                    }
                     if (limit > eps) {
                         cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
                         cb(cur, "ffn_moe_gate_clamped", il);
