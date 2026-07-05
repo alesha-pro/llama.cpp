@@ -3209,8 +3209,15 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     // the client-consistent mtp_mask input; strict '<' keeps a rejected
     // position's stale KV invisible to the reject candidate.
     // ------------------------------------------------------------------
-    if (mtp_spec && mtp_spec_ring_read != nullptr &&
-        (inp_out_ids ? n_outputs : n_tokens) >= 1) {
+    // Candidate drafting runs ONLY on genuine decode ubatches. On the final
+    // prompt ubatch inp_out_ids selects one output row out of many tokens
+    // (n_outputs < n_tokens); building candidates there put the CUDA argmax
+    // draft id through a CPU get_rows(tok_embd) whose cross-backend i32 copy
+    // is unreliable in this build -> OOB embedding index. Real decode keeps the
+    // lookup on-device. (The server only needs the draft from decode steps.)
+    const bool mtp_cand = mtp_spec && mtp_spec_ring_read != nullptr &&
+        n_tokens <= 2 && (inp_out_ids == nullptr || n_outputs == n_tokens);
+    if (mtp_cand) {
         dsv4_mtp_module & mtp = dsv4_mtp_get();
         auto * di = get_dsv4_inputs();
         const int64_t nt    = n_tokens;
@@ -3336,7 +3343,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         // input = h(out_hc of level-1, last col) + e(embed(draft1_last)); its
         // attention adds the last candidate's level-1 KV (position q2-1) + own.
         // Built only for K=2 verify triples (nt>=3): pair clients never read it.
-        if (nt >= 3) {
+        if (nc >= 3) {
             ggml_tensor * hc1 = ggml_view_3d(ctx0, chc, n_embd, n_hc, 1,
                     chc->nb[1], chc->nb[2], (size_t)(nc - 1) * chc->nb[2]);
             ggml_tensor * d1_last = ggml_view_1d(ctx0, cdraft, 1, (size_t)(nc - 1) * cdraft->nb[0]);
