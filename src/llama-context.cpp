@@ -226,6 +226,13 @@ llama_context::llama_context(
             }
             backends.emplace_back(backend);
         }
+        if (model.expert_parallel_dev != nullptr) {
+            ggml_backend_t backend = ggml_backend_dev_init(model.expert_parallel_dev, nullptr);
+            if (backend == nullptr) {
+                throw std::runtime_error("failed to initialize DeepSeek-V4 expert-parallel meta backend");
+            }
+            backends.emplace_back(backend);
+        }
 
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {

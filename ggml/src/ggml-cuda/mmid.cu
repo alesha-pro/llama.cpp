@@ -27,13 +27,54 @@ template <int n_expert_used_template>
 __launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
-        const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1) {
+        const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1,
+        const int expert_base) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
     const int expert = blockIdx.x;
+    const int expert_global = expert_base + expert;
+    const int expert_end = expert_base + gridDim.x;
 
     extern __shared__ char data_mm_ids_helper[];
     mm_ids_helper_store * store = (mm_ids_helper_store *) data_mm_ids_helper;
+
+    // Graph warmup may deliberately use all experts (for DS4: 256 ids per
+    // token) even though real inference uses top-6.  The warp-specialized
+    // compactor below stores at most one matching slot per lane, so handle
+    // these uncommon wide-id shapes with a simple deterministic thread-0
+    // path.  It runs only during warmup / unusual models and is tiny compared
+    // with the expert matmuls.
+    if (n_expert_used > warp_size) {
+        if (threadIdx.x != 0) {
+            return;
+        }
+
+        int nex_prev_wide = 0;
+        for (int it = 0; it < n_tokens; ++it) {
+            for (int iex = 0; iex < n_expert_used; ++iex) {
+                const int expert_used = ids[it*si1 + iex];
+                nex_prev_wide += expert_used >= expert_base && expert_used < expert_end && expert_used < expert_global;
+            }
+        }
+
+        int it_compact_wide = 0;
+        for (int it = 0; it < n_tokens; ++it) {
+            for (int iex = 0; iex < n_expert_used; ++iex) {
+                if (ids[it*si1 + iex] != expert_global) {
+                    continue;
+                }
+                ids_src1[nex_prev_wide + it_compact_wide] = it*sis1 + iex % nchannels_y;
+                ids_dst [nex_prev_wide + it_compact_wide] = it*n_expert_used + iex;
+                ++it_compact_wide;
+            }
+        }
+
+        expert_bounds[expert] = nex_prev_wide;
+        if (expert == static_cast<int>(gridDim.x) - 1) {
+            expert_bounds[gridDim.x] = nex_prev_wide + it_compact_wide;
+        }
+        return;
+    }
 
     int nex_prev   = 0; // Number of columns for experts with a lower index.
     int it_compact = 0; // Running index for the compact slice of this expert.
@@ -54,8 +95,8 @@ static __global__ void mm_ids_helper(
             int match    = 0;  // 1 if this lane's slot routes to this block's expert.
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
                 const int expert_used = ids[it*si1 + iex];
-                nex_prev += expert_used < expert;
-                if (expert_used == expert) {
+                nex_prev += expert_used >= expert_base && expert_used < expert_end && expert_used < expert_global;
+                if (expert_used == expert_global) {
                     iex_used = iex;
                     match    = 1;
                 }
@@ -89,8 +130,8 @@ static __global__ void mm_ids_helper(
             const int iex = threadIdx.x % neu_padded; // The index at which the expert is used, if any.
             const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
                 ids[it*si1 + iex] : INT_MAX;
-            const int iex_used = expert_used == expert ? iex : -1;
-            nex_prev += expert_used < expert;
+            const int iex_used = expert_used == expert_global ? iex : -1;
+            nex_prev += expert_used >= expert_base && expert_used < expert_end && expert_used < expert_global;
 
             // Whether the threads at this token position have used the expert:
             const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
@@ -139,17 +180,14 @@ static __global__ void mm_ids_helper(
 template <int n_expert_used_template>
 static void launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
-        const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, cudaStream_t stream) {
+        const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1,
+        const int expert_base, cudaStream_t stream) {
     GGML_ASSERT(n_tokens          < (1 << 22) && "too few bits in mm_ids_helper_store");
     GGML_ASSERT(n_expert_used_var < (1 << 10) && "too few bits in mm_ids_helper_store");
 
     const int id = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
-    // The generic occurrence-based path inspects exactly one expert slot per lane, so it is only
-    // correct when n_expert_used <= warp_size (otherwise a lane could own multiple matching slots
-    // but only records one). True for every supported expert count (the templates topped out at 32).
-    GGML_ASSERT(n_expert_used_var <= warp_size && "mm_ids_helper assumes n_expert_used <= warp_size");
     CUDA_SET_SHARED_MEMORY_LIMIT(mm_ids_helper<n_expert_used_template>, smpbo);
 
     const dim3 num_blocks(n_experts, 1, 1);
@@ -158,20 +196,22 @@ static void launch_mm_ids_helper(
     // a single expert can receive up to n_tokens*n_expert_used routed slots (e.g. if many tokens
     // route duplicate slots to the same expert), so it_compact can exceed n_tokens. (The original
     // presence-based code bounded it_compact by n_tokens; occurrence-based does not.)
-    const size_t nbytes_shared = (size_t) n_tokens * n_expert_used_var * sizeof(mm_ids_helper_store);
+    const size_t nbytes_shared = n_expert_used_var <= warp_size ?
+        (size_t) n_tokens * n_expert_used_var * sizeof(mm_ids_helper_store) : 0;
     GGML_ASSERT(nbytes_shared <= smpbo);
     mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
-        (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1);
+        (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, expert_base);
 }
 
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
-        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, cudaStream_t stream) {
+        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1,
+        const int expert_base, cudaStream_t stream) {
     // NOTE: always use the generic (occurrence-based) implementation. The templated optimized
     // paths (case 2/4/6/8/16/32) compact by token-PRESENCE (warp_reduce_any) and therefore
     // collapse a token's duplicate expert slots into one entry, leaving holes in ids_src1/ids_dst
     // for models that route a token to the same expert twice (this REAP DeepSeek-V4 does). The
     // generic path is occurrence-correct; the helper cost is negligible next to the expert
     // matmuls, so routing everything through it is the safe choice. See mm_ids_helper<0> above.
-    launch_mm_ids_helper<0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, stream);
+    launch_mm_ids_helper<0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, expert_base, stream);
 }

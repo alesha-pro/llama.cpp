@@ -366,6 +366,11 @@ extern "C" {
 
         GGML_BACKEND_SPLIT_AXIS_MIRRORED = 10, // all values on all backends
         GGML_BACKEND_SPLIT_AXIS_PARTIAL  = 11, // each backend has a partial sum
+        // Same logical shape on every backend, but each backend contains only
+        // the entries routed to its local MoE expert shard.  Unlike PARTIAL,
+        // this state must not trigger a collective until the expert down
+        // projection has produced a hidden-state partial sum.
+        GGML_BACKEND_SPLIT_AXIS_EXPERT_LOCAL = 12,
 
         // for internal bookkeeping only:
         GGML_BACKEND_SPLIT_AXIS_NONE    = 98,

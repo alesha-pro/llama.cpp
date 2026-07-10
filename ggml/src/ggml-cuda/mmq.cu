@@ -198,9 +198,25 @@ void ggml_cuda_mul_mat_q(
     const int64_t ne_get_rows = ne12 * n_expert_used;
     GGML_ASSERT(ne1 == n_expert_used);
 
+    const bool expert_shard = dsv4_expert_shard_op(dst);
+    const int expert_base = dsv4_expert_shard_base(dst);
+    if (expert_shard) {
+        // Remote expert slots are intentionally absent from this local shard.
+        // Zero them before compacted local jobs write their owned slots.
+        CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), stream));
+    }
+
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
+    if (expert_shard) {
+        // Quantization keeps the fixed full top-k allocation for graph-shape
+        // stability.  Entries beyond the local compacted count are ignored by
+        // expert_bounds, but still need a valid source index while the fixed
+        // quantize grid runs.
+        CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows*sizeof(int32_t), stream));
+        CUDA_CHECK(cudaMemsetAsync(ids_dst.get(),  0, ne_get_rows*sizeof(int32_t), stream));
+    }
 
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
@@ -208,7 +224,7 @@ void ggml_cuda_mul_mat_q(
         const int sis1 = nb12 / nb11;
 
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+            ne02, ne12, n_expert_used, ne11, si1, sis1, expert_base, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -326,6 +342,14 @@ void ggml_cuda_mul_mat_q_fused_up_gate(
     const int64_t ne10_padded   = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const int64_t n_expert_used = ids->ne[0];
     const int64_t ne_get_rows   = ne12 * n_expert_used;
+    const bool expert_shard = dsv4_expert_shard_op(up);
+    const int expert_base = dsv4_expert_shard_base(up);
+    GGML_ASSERT(!expert_shard || dsv4_expert_shard_base(gate) == expert_base);
+
+    if (expert_shard) {
+        CUDA_CHECK(cudaMemsetAsync(up->data,   0, ggml_nbytes(up),   stream));
+        CUDA_CHECK(cudaMemsetAsync(gate->data, 0, ggml_nbytes(gate), stream));
+    }
 
     const bool use_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
                             || GGML_CUDA_CC_IS_CDNA(cc);
@@ -334,6 +358,10 @@ void ggml_cuda_mul_mat_q_fused_up_gate(
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
+    if (expert_shard) {
+        CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows*sizeof(int32_t), stream));
+        CUDA_CHECK(cudaMemsetAsync(ids_dst.get(),  0, ne_get_rows*sizeof(int32_t), stream));
+    }
 
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
@@ -341,7 +369,7 @@ void ggml_cuda_mul_mat_q_fused_up_gate(
         const int sis1 = src1->nb[2] / src1->nb[1];
 
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+            ne02, ne12, n_expert_used, ne11, si1, sis1, expert_base, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 

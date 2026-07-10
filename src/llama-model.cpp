@@ -352,6 +352,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const std::regex pattern_ffn_down_weight   ("blk\\.\\d*\\.ffn_down(_exps)?.weight");
     const std::regex pattern_ffn_down_bias     ("blk\\.\\d*\\.ffn_down.bias");
     const std::regex pattern_ffn_down_exps_bias("blk\\.\\d*\\.ffn_down_exps.bias");
+    const std::regex pattern_dsv4_routed_expert_weight("blk\\.\\d*\\.ffn_(up|gate|down)_exps\\.weight");
 
     const std::regex pattern_output_weight("output\\.weight");
     const std::regex pattern_output_bias  ("output\\.bias");
@@ -408,6 +409,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        if (ud->model->expert_parallel_dev != nullptr &&
+                std::regex_match(tensor_name, pattern_dsv4_routed_expert_weight)) {
+            // Keep each routed expert full-width and shard the expert axis.
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+        }
+
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
@@ -551,6 +558,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<int64_t> & segments) -> std::vector<int64_t> {
+        if (ud->model->expert_parallel_dev != nullptr &&
+                std::regex_match(tensor_name, pattern_dsv4_routed_expert_weight)) {
+            return std::vector<int64_t>(segments.size(), 1);
+        }
         if (hparams.is_recurrent(il)) {
             // linear attention
             const int64_t head_dim  = hparams.ssm_d_state;
@@ -628,10 +639,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         const int64_t ne_full = tensor->ne[split_state.axis];
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
         const float * tensor_split = ud->model->tensor_split();
+        const bool equal_expert_split = ud->model->expert_parallel_dev != nullptr &&
+            std::regex_match(tensor_name, pattern_dsv4_routed_expert_weight);
         std::vector<float> tensor_split_scan;
         tensor_split_scan.reserve(ud->n_devices);
         for (size_t j = 0; j < ud->n_devices; j++) {
-            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % ud->n_devices]);
+            tensor_split_scan.push_back(equal_expert_split || tensor_split == nullptr ?
+                0.0f : tensor_split[(j + tc.rotation) % ud->n_devices]);
             if (j > 0) {
                 tensor_split_scan[j] += tensor_split_scan[j - 1];
             }
@@ -950,6 +964,7 @@ struct llama_model::impl {
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
+    buft_list_t expert_buft_list;
 
     struct layer_dev {
         ggml_backend_dev_t dev;
@@ -1185,6 +1200,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // add CPU buffer types as a fallback
         buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
         pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
+    }
+    if (expert_parallel_dev != nullptr) {
+        pimpl->expert_buft_list = make_gpu_buft_list(expert_parallel_dev, LLAMA_SPLIT_MODE_LAYER, nullptr);
+        pimpl->expert_buft_list.insert(
+            pimpl->expert_buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
     }
 
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1550,7 +1570,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-    const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+    const bool routed_expert = tn.tensor == LLM_TENSOR_FFN_UP_EXPS ||
+                               tn.tensor == LLM_TENSOR_FFN_GATE_EXPS ||
+                               tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS;
+    const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr :
+        (expert_parallel_dev != nullptr && routed_expert ? &pimpl->expert_buft_list : pimpl->dev_layer.at(tn.bid).buft_list);
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);

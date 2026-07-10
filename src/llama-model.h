@@ -591,6 +591,11 @@ struct llama_model {
     // list of devices used in this model
     std::vector<llama_device> devices;
 
+    // Optional hybrid meta device used only for routed MoE expert tensors.
+    // The regular device list remains intact so attention, KV and shared
+    // experts keep the low-communication layer split placement.
+    ggml_backend_dev_t expert_parallel_dev = nullptr;
+
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 

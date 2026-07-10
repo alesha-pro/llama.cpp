@@ -20,6 +20,7 @@
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -258,6 +259,38 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             model->devices.clear();
             model->devices.push_back(main_gpu);
         }
+    }
+
+    if (std::getenv("DSV4_EXPERT_PARALLEL") != nullptr) {
+        if (model->arch != LLM_ARCH_DEEPSEEK4) {
+            LLAMA_LOG_ERROR("%s: DSV4_EXPERT_PARALLEL is only implemented for DeepSeek-V4\n", __func__);
+            return false;
+        }
+        if (params.split_mode != LLAMA_SPLIT_MODE_LAYER) {
+            LLAMA_LOG_ERROR("%s: DSV4_EXPERT_PARALLEL requires --split-mode layer\n", __func__);
+            return false;
+        }
+        if (model->devices.size() < 2) {
+            LLAMA_LOG_ERROR("%s: DSV4_EXPERT_PARALLEL requires at least two GPU devices\n", __func__);
+            return false;
+        }
+
+        std::vector<ggml_backend_dev_t> expert_devs;
+        expert_devs.reserve(model->devices.size());
+        for (const llama_device & dev : model->devices) {
+            if (dev.is_meta || ggml_backend_dev_type(dev.dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                LLAMA_LOG_ERROR("%s: DSV4_EXPERT_PARALLEL currently requires direct GPU devices\n", __func__);
+                return false;
+            }
+            expert_devs.push_back(dev.dev);
+        }
+
+        model->get_split_state_ud.n_devices = expert_devs.size();
+        model->get_split_state_ud.model     = model;
+        model->expert_parallel_dev = ggml_backend_meta_device(
+            expert_devs.data(), expert_devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud);
+        LLAMA_LOG_INFO("%s: DSV4_EXPERT_PARALLEL=1 - sharding routed experts across %zu devices\n",
+            __func__, expert_devs.size());
     }
 
     for (const auto & dev : model->devices) {
@@ -575,4 +608,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

@@ -32,6 +32,12 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
+    const bool expert_shard = ids != nullptr &&
+        ggml_get_op_params_i32(dst, 0) == GGML_MUL_MAT_ID_EXPERT_SHARD_MAGIC;
+    const int expert_base = expert_shard ? ggml_get_op_params_i32(dst, 1) : 0;
+    if (expert_shard) {
+        CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), ctx.stream()));
+    }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = src1->nb[1] / ts_src1;
@@ -85,7 +91,8 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
         GGML_ASSERT(sis1 > 0);
 
         ggml_cuda_launch_mm_ids_helper(ids_d, ids_src_compact_dev.get(), ids_dst_compact_dev.get(), expert_bounds_dev.get(),
-            static_cast<int>(n_experts), static_cast<int>(n_tokens), static_cast<int>(n_expert_used), static_cast<int>(ne11), si1, sis1, ctx.stream());
+            static_cast<int>(n_experts), static_cast<int>(n_tokens), static_cast<int>(n_expert_used), static_cast<int>(ne11), si1, sis1,
+            expert_base, ctx.stream());
         CUDA_CHECK(cudaGetLastError());
 
         ids_info.ids_src_compact   = ids_src_compact_dev.get();

@@ -2639,6 +2639,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool expert_shard = ggml_get_op_params_i32(dst, 0) == GGML_MUL_MAT_ID_EXPERT_SHARD_MAGIC;
+
+    // All expert-parallel quantized paths use the compacting MMQ route.  It
+    // understands global router ids plus a local expert base and works for
+    // both prefill and single-token decode; the direct MMVQ kernels assume
+    // ids index src0->ne[2] locally and would access remote shards OOB.
+    if (expert_shard && ggml_is_quantized(src0->type)) {
+        ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+        return;
+    }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -3251,6 +3261,27 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+
+    // A synchronized meta tensor is mirrored across its simple CUDA
+    // backends.  Read it from the copy that lives on the destination device
+    // so hybrid layer/expert parallel graphs stay entirely on the GPUs.
+    if (ggml_backend_is_meta(backend_src) && ggml_backend_is_cuda(backend_dst) &&
+            ggml_backend_buffer_is_meta(buf_src) && ggml_backend_buffer_is_cuda(buf_dst) &&
+            ggml_backend_meta_tensor_is_mirrored(src)) {
+        const size_t n_backends = ggml_backend_meta_n_backends(backend_src);
+        size_t j_src = 0;
+        for (size_t j = 0; j < n_backends; ++j) {
+            if (ggml_backend_get_device(ggml_backend_meta_simple_backend(backend_src, j)) ==
+                    ggml_backend_get_device(backend_dst)) {
+                j_src = j;
+                break;
+            }
+        }
+        ggml_backend_t simple_backend_src = ggml_backend_meta_simple_backend(backend_src, j_src);
+        const ggml_tensor * simple_src = ggml_backend_meta_buffer_simple_tensor(src, j_src);
+        GGML_ASSERT(simple_src != nullptr);
+        return ggml_backend_cuda_cpy_tensor_async(simple_backend_src, backend_dst, simple_src, dst);
+    }
 
     if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
         return false;
