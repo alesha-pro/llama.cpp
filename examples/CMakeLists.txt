@@ -20,6 +20,7 @@ else()
     add_subdirectory(eval-callback)
     add_subdirectory(ds4-mtp-accept)
     add_subdirectory(ds4-mtp-spec)
+    add_subdirectory(ds4-topk-overlap)
 
     add_subdirectory(gguf-hash)
     add_subdirectory(gguf)

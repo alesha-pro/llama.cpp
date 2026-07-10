@@ -9089,6 +9089,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2048, 2, 1, 3}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2049, 2, 1, 3}, k));
     }
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32768, 1, 1, 1}, 512));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32779, 1, 1, 1}, 512, true));
 
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {
@@ -9381,6 +9383,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
     // lightning_indexer
+    // DeepSeek-V4 decode: one query over the long-context compressed K cache.
+    test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32, {128, 64, 1, 1}, {128, 1, 8192, 1}, {64, 1, 1, 1}, 1.0f / sqrtf(float(128)), 1.0f / sqrtf(float(64))));
+    test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32, {128, 64, 1, 1}, {128, 1, 32768, 1}, {64, 1, 1, 1}, 1.0f / sqrtf(float(128)), 1.0f / sqrtf(float(64))));
     test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32, {128, 64, 128, 1}, {128, 1, 256, 1}, {64, 128, 1, 1}, 1.0f / sqrtf(float(128)), 1.0f / sqrtf(float(64))));
     test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_F32, {128, 64, 128, 1}, {128, 1, 256, 1}, {64, 128, 1, 1}, 1.0f / sqrtf(float(128)), 1.0f / sqrtf(float(64))));
     test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_Q4_1, GGML_TYPE_F32, {128, 64, 128, 1}, {128, 1, 256, 1}, {64, 128, 1, 1}, 1.0f / sqrtf(float(128)), 1.0f / sqrtf(float(64))));
@@ -9635,6 +9640,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {200000, 16, 1, 1}));
 
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2, 1, 1, 1}, 1));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8192, 1, 1, 1}, 512));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32768, 1, 1, 1}, 512));
     for (auto k : {1, 10, 40, 400}) {
         for (auto nrows : {1, 16}) {
             for (auto cols : {k, 1000, 65000, 200000}) {
@@ -9683,6 +9690,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
 
     // lightning_indexer
+    // DeepSeek-V4 decode: one query over the long-context compressed K cache.
+    test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32, {128, 64, 1, 1}, {128, 1, 8192, 1}, {64, 1, 1, 1}, 1.0f / sqrtf(float(128)), 1.0f / sqrtf(float(64))));
+    test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32, {128, 64, 1, 1}, {128, 1, 32768, 1}, {64, 1, 1, 1}, 1.0f / sqrtf(float(128)), 1.0f / sqrtf(float(64))));
     test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32, {128, 64, 128, 1}, {128, 1, 256, 1}, {64, 128, 1, 1}, 1.0f / sqrtf(float(128)), 1.0f / sqrtf(float(64))));
     test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_F32, {128, 64, 128, 1}, {128, 1, 256, 1}, {64, 128, 1, 1}, 1.0f / sqrtf(float(128)), 1.0f / sqrtf(float(64))));
     test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_Q4_1, GGML_TYPE_F32, {128, 64, 128, 1}, {128, 1, 256, 1}, {64, 128, 1, 1}, 1.0f / sqrtf(float(128)), 1.0f / sqrtf(float(64))));

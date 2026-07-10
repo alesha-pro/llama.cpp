@@ -268,6 +268,36 @@ static bool dsv4_topk_gather_disabled() {
     return v;
 }
 
+// Fuse the single-token Lightning Indexer score path (env
+// DSV4_DECODE_FUSED_IDX=1). The legacy path launches separate matmul, ReLU,
+// scale/mul, permute and reduction ops and materializes the per-head scores.
+// The fused CUDA op streams each compressed K row once and reduces all heads
+// before writing the final score. Off by default until decode A/B validation.
+static bool dsv4_decode_fused_idx_enabled() {
+    static const bool v = [] {
+        const bool enabled = getenv("DSV4_DECODE_FUSED_IDX") != nullptr;
+        if (enabled) {
+            fprintf(stderr, "dsv4: DSV4_DECODE_FUSED_IDX=1 - using fused decode Lightning Indexer\n");
+        }
+        return enabled;
+    }();
+    return v;
+}
+
+// Exact single-row radix-select Top-512 (env DSV4_DECODE_RADIX_TOPK=1).
+// Unlike the legacy full argsort, this returns the exact set in unspecified
+// order; the following gather attention is invariant to that order.
+static bool dsv4_decode_radix_topk_enabled() {
+    static const bool v = [] {
+        const bool enabled = getenv("DSV4_DECODE_RADIX_TOPK") != nullptr;
+        if (enabled) {
+            fprintf(stderr, "dsv4: DSV4_DECODE_RADIX_TOPK=1 - using exact radix-select Top-512\n");
+        }
+        return enabled;
+    }();
+    return v;
+}
+
 // Indexer-score width bucket (rows) for the gather path: the score/argsort
 // shapes change only every DSV4_CS_BUCKET*ratio tokens (=8192 at ratio 4), so
 // the decode graph replays in between instead of recapturing every boundary.
@@ -1800,6 +1830,14 @@ static ggml_tensor * dsv4_build_indexer_scores_decode(
             rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, false);
 
     ggml_tensor * k = ggml_reshape_3d(ctx, index_kv, n_index_head_size, 1, n_comp);
+    if (dsv4_decode_fused_idx_enabled()) {
+        ggml_tensor * weights = ggml_mul_mat(ctx, wproj, x); // [n_heads, 1]
+        ggml_tensor * score = ggml_lightning_indexer(ctx, q, k, weights,
+                1.0f / std::sqrt((float) n_index_head_size),
+                1.0f / std::sqrt((float) n_index_head));
+        return ggml_reshape_2d(ctx, score, n_comp, 1);
+    }
+
     k = ggml_permute(ctx, k, 0, 2, 1, 3); // [head_dim, n_comp, 1]
     q = ggml_permute(ctx, q, 0, 2, 1, 3); // [head_dim, 1, n_heads]
 
@@ -2859,9 +2897,12 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                         0, n_comp_cache - 1, DSV4_CS_BUCKET, compress_ratio,
                                         "dsv4_idx_score_bucket_mask");
                                 index_scores = ggml_add(ctx0, index_scores, idx_score_mask);
+                                cb(index_scores, "indexer_scores_masked", il);
 
                                 const int64_t top_k = hparams.indexer_top_k;
-                                ggml_tensor * topk = ggml_argsort_top_k(ctx0, index_scores, top_k);
+                                ggml_tensor * topk = dsv4_decode_radix_topk_enabled()
+                                        ? ggml_top_k(ctx0, index_scores, top_k)
+                                        : ggml_argsort_top_k(ctx0, index_scores, top_k);
                                 cb(topk, "indexer_topk", il);
                                 topk = ggml_reshape_1d(ctx0, topk, top_k);
 
