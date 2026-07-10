@@ -5,7 +5,32 @@
 #include "unary.cuh"
 
 #include <algorithm>
+#include <cstdlib>
 #include <vector>
+
+static bool dsv4_moe_resident_enabled() {
+    static const bool enabled = std::getenv("DSV4_MOE_RESIDENT") != nullptr;
+    return enabled;
+}
+
+static int dsv4_moe_resident_tile() {
+    static const int tile = [] {
+        const char * value = std::getenv("DSV4_MOE_RESIDENT_TILE");
+        int parsed = value != nullptr ? std::atoi(value) : 16;
+        parsed = std::max(8, std::min(128, parsed));
+        return GGML_PAD(parsed, 8);
+    }();
+    return tile;
+}
+
+static bool dsv4_expert_shard_op(const ggml_tensor * node) {
+    return node->op == GGML_OP_MUL_MAT_ID &&
+        ggml_get_op_params_i32(node, 0) == GGML_MUL_MAT_ID_EXPERT_SHARD_MAGIC;
+}
+
+static int dsv4_expert_shard_base(const ggml_tensor * node) {
+    return dsv4_expert_shard_op(node) ? ggml_get_op_params_i32(node, 1) : 0;
+}
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
@@ -160,7 +185,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            use_stream_k, ne1};
+            use_stream_k, ne1, false};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -232,7 +257,10 @@ void ggml_cuda_mul_mat_q(
     // skipped during CUDA graph capture (sync is forbidden there) and for
     // small batches where the bound is tight anyway.
     static const bool moe_tile = getenv("DSV4_MOE_TILE") != nullptr;
-    if (moe_tile && ne12 >= 64) {
+    const bool moe_resident = dsv4_moe_resident_enabled() && ne12 >= 64;
+    if (moe_resident) {
+        ncols_max = dsv4_moe_resident_tile();
+    } else if (moe_tile && ne12 >= 64) {
         cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
         CUDA_CHECK(cudaStreamIsCapturing(stream, &cap));
         if (cap == cudaStreamCaptureStatusNone) {
@@ -258,7 +286,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        use_stream_k, ncols_max};
+        use_stream_k, ncols_max, moe_resident};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
@@ -338,7 +366,10 @@ void ggml_cuda_mul_mat_q_fused_up_gate(
     // shared: DSV4_MOE_TILE actual per-expert column bound (one readback for both)
     int64_t ncols_max = ne_get_rows;
     static const bool moe_tile = getenv("DSV4_MOE_TILE") != nullptr;
-    if (moe_tile && ne12 >= 64) {
+    const bool moe_resident = dsv4_moe_resident_enabled() && ne12 >= 64;
+    if (moe_resident) {
+        ncols_max = dsv4_moe_resident_tile();
+    } else if (moe_tile && ne12 >= 64) {
         cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
         CUDA_CHECK(cudaStreamIsCapturing(stream, &cap));
         if (cap == cudaStreamCaptureStatusNone) {
@@ -384,7 +415,7 @@ void ggml_cuda_mul_mat_q_fused_up_gate(
             src0->ne[0], src0->ne[1], ne_get_rows, s01, ne_get_rows, s1,
             ne02, ne02, s02, s12q, s2,
             src0->ne[3], ne13, s03, s13q, s3,
-            use_stream_k, ncols_max};
+            use_stream_k, ncols_max, moe_resident};
 
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
     }
@@ -393,10 +424,13 @@ void ggml_cuda_mul_mat_q_fused_up_gate(
     ggml_cuda_op_swiglu_clamp(ctx, glu_dst);
 
     static bool logged = false;
-    if (!logged) {
+    // During graph reservation llama.cpp calls this path with a tiny shape
+    // first. If resident mode was requested, wait for the first eligible
+    // prefill so the one-shot log reflects the scheduler that actually ran.
+    if (!logged && (!dsv4_moe_resident_enabled() || moe_resident)) {
         logged = true;
-        fprintf(stderr, "%s: DSV4_MOE_FUSE=1 - fused up+gate MMQ engaged (ne12=%lld, ncols_max=%lld)\n",
-                __func__, (long long) ne12, (long long) ncols_max);
+        fprintf(stderr, "%s: DSV4_MOE_FUSE=1 - fused up+gate MMQ engaged (ne12=%lld, ncols_max=%lld, resident=%d)\n",
+                __func__, (long long) ne12, (long long) ncols_max, (int) moe_resident);
     }
 }
 
@@ -435,7 +469,7 @@ void ggml_cuda_op_mul_mat_q(
         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,
-        use_stream_k, src1_ncols};
+        use_stream_k, src1_ncols, false};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 

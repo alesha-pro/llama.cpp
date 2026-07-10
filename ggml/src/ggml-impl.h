@@ -1,5 +1,10 @@
 #pragma once
 
+// Internal MUL_MAT_ID op-parameter tag used by the meta backend when the
+// expert dimension of an MoE weight tensor is sharded across devices.
+// op_params[1] stores the first global expert id owned by the local shard.
+#define GGML_MUL_MAT_ID_EXPERT_SHARD_MAGIC 0x45505348
+
 // GGML internal header
 
 #include "ggml.h"

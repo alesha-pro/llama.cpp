@@ -3525,6 +3525,127 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 }
 
 
+// DSV4_MOE_RESIDENT: compact the variable-sized expert buckets entirely on the
+// device, then let one resident CTA per SM pull complete output tiles from a
+// global work queue.  Each job owns the full K reduction for one
+// (expert, token tile, output-row tile), so no stream-k fixup is required.
+//
+// schedule layout: [expert tile prefix: n_experts + 1][next job]
+template <int mmq_x>
+static __global__ void build_moe_resident_schedule(
+        const int32_t * __restrict__ expert_bounds, int32_t * __restrict__ schedule, const int n_experts) {
+    if (blockIdx.x != 0 || threadIdx.x != 0 || threadIdx.y != 0) {
+        return;
+    }
+
+    int32_t total = 0;
+    schedule[0] = 0;
+    for (int expert = 0; expert < n_experts; ++expert) {
+        const int32_t ncols = expert_bounds[expert + 1] - expert_bounds[expert];
+        total += (ncols + mmq_x - 1) / mmq_x;
+        schedule[expert + 1] = total;
+    }
+    schedule[n_experts + 1] = 0;
+}
+
+template <ggml_type type, int mmq_x, bool need_check>
+#if defined(GGML_USE_HIP)
+    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 1)
+#else
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 1)
+#else
+    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
+#endif
+#endif
+static __global__ void mul_mat_q_moe_resident(
+        const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds, int32_t * __restrict__ schedule, float * __restrict__ dst,
+        const uint3 blocks_per_ne00, const int nrows_x, const int ncols_y, const int stride_row_x,
+        const int stride_col_dst, const int stride_channel_x, const int n_experts) {
+    if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
+        NO_DEVICE_CODE;
+        return;
+    }
+
+    constexpr int nwarps   = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int mmq_y    = get_mmq_y_device();
+    constexpr int y_stride = sizeof(block_q8_1_mmq) / sizeof(int);
+
+    const int nty = (nrows_x + mmq_y - 1) / mmq_y;
+    const int total_jobs = schedule[n_experts] * nty;
+
+    extern __shared__ int ids_dst_shared[];
+    __shared__ int job_shared;
+    __shared__ int expert_shared;
+    __shared__ int jt_shared;
+    __shared__ int it_shared;
+
+    while (true) {
+        if (threadIdx.x == 0 && threadIdx.y == 0) {
+            const int job = atomicAdd(schedule + n_experts + 1, 1);
+            job_shared = job < total_jobs ? job : -1;
+
+            if (job < total_jobs) {
+                const int tile = job / nty;
+                it_shared = job - tile * nty;
+
+                // Find prefix[e] <= tile < prefix[e + 1]. Empty experts are
+                // naturally skipped because their two prefix entries match.
+                int lo = 0;
+                int hi = n_experts;
+                while (lo + 1 < hi) {
+                    const int mid = (lo + hi) / 2;
+                    if (schedule[mid] <= tile) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                expert_shared = lo;
+                jt_shared = tile - schedule[lo];
+            }
+        }
+        __syncthreads();
+
+        if (job_shared < 0) {
+            return;
+        }
+
+        const int expert  = expert_shared;
+        const int jt      = jt_shared;
+        const int it      = it_shared;
+        const int col_low = expert_bounds[expert];
+        const int col_diff = expert_bounds[expert + 1] - col_low;
+
+#pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += nwarps * warp_size) {
+            const int j = j0 + threadIdx.y * warp_size + threadIdx.x;
+            if (j < mmq_x) {
+                ids_dst_shared[j] = jt * mmq_x + j < col_diff ? ids_dst[col_low + jt * mmq_x + j] : 0;
+            }
+        }
+        __syncthreads();
+
+        const int offset_x = expert * stride_channel_x + it * mmq_y * stride_row_x;
+        const int offset_y = (col_low + jt * mmq_x) * y_stride;
+        const int tile_x_max_i = nrows_x - it * mmq_y - 1;
+        const int tile_y_max_j = col_diff - jt * mmq_x - 1;
+
+        constexpr bool fixup = false;
+        mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
+            (x, offset_x, y + offset_y, ids_dst_shared, dst + it * mmq_y, nullptr,
+             stride_row_x, ncols_y, stride_col_dst, tile_x_max_i, tile_y_max_j,
+             0, blocks_per_ne00.z);
+
+        // write_back reads ids_dst_shared; do not let the next job overwrite it
+        // until every warp has finished the current tile.
+        __syncthreads();
+    }
+}
+
+
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
 template <ggml_type type, int mmq_x, bool need_check>
@@ -3926,7 +4047,7 @@ struct mmq_args {
     int64_t ncols_x; int64_t nrows_x; int64_t ncols_dst; int64_t stride_row_x; int64_t ncols_y; int64_t nrows_dst;
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
-    bool use_stream_k; int64_t ncols_max;
+    bool use_stream_k; int64_t ncols_max; bool moe_resident;
 };
 
 template<ggml_type type>
@@ -3971,6 +4092,38 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 nsamples_y_fd      = init_fastdiv_values(args.nsamples_y);
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
+
+    if (args.moe_resident) {
+        GGML_ASSERT(args.ids_dst != nullptr);
+        GGML_ASSERT(args.expert_bounds != nullptr);
+        GGML_ASSERT(args.nchannels_x == args.nchannels_y);
+        GGML_ASSERT(args.nsamples_x == 1 && args.nsamples_y == 1);
+
+        ggml_cuda_pool_alloc<int32_t> schedule(ctx.pool(id), args.nchannels_y + 2);
+        build_moe_resident_schedule<mmq_x><<<1, 1, 0, stream>>>
+            (args.expert_bounds, schedule.get(), args.nchannels_y);
+        CUDA_CHECK(cudaGetLastError());
+
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_moe_resident<type, mmq_x, false>), nbytes_shared);
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_moe_resident<type, mmq_x,  true>), nbytes_shared);
+
+        const dim3 resident_blocks(nsm, 1, 1);
+        if (args.nrows_x % mmq_y == 0) {
+            constexpr bool need_check = false;
+            mul_mat_q_moe_resident<type, mmq_x, need_check><<<resident_blocks, block_dims, nbytes_shared, stream>>>
+                (args.x, args.y, args.ids_dst, args.expert_bounds, schedule.get(), args.dst,
+                 blocks_per_ne00_fd, args.nrows_x, args.ncols_y, args.stride_row_x,
+                 args.nrows_dst, args.stride_channel_x, args.nchannels_y);
+        } else {
+            constexpr bool need_check = true;
+            mul_mat_q_moe_resident<type, mmq_x, need_check><<<resident_blocks, block_dims, nbytes_shared, stream>>>
+                (args.x, args.y, args.ids_dst, args.expert_bounds, schedule.get(), args.dst,
+                 blocks_per_ne00_fd, args.nrows_x, args.ncols_y, args.stride_row_x,
+                 args.nrows_dst, args.stride_channel_x, args.nchannels_y);
+        }
+
+        return;
+    }
 
     if (!args.use_stream_k) {
         if (args.nrows_x % mmq_y == 0) {
@@ -4176,4 +4329,3 @@ void ggml_cuda_op_mul_mat_q(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
-
