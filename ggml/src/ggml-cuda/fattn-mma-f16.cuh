@@ -1883,12 +1883,14 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     using fattn_kernel_ptr_t = fattn_kernel_t;
 #endif // defined(GGML_USE_HIP)
     fattn_kernel_t fattn_kernel;
+    bool use_top_k_runtime = false;
 
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
         if constexpr (may_use_top_k) {
             if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_top_k(ctx, dst)) {
                 constexpr bool use_top_k = true;
+                use_top_k_runtime = true;
                 // every top_k caller (V3.2 DSA 576, V4 NSA 512) is MLA with V a
                 // view of K - reuse the gathered K tiles for V instead of a
                 // second scalar gather of the same rows
@@ -1912,7 +1914,8 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     }
 
     launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, warp_size_host);
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true,
+         warp_size_host, use_top_k_runtime);
 }
 
 
