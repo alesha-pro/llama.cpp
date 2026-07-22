@@ -94,6 +94,7 @@ extern "C" {
 
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
+    GGML_API ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend_buffer_t buffer, size_t index);
     GGML_API struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index);
     GGML_API bool ggml_backend_meta_tensor_is_mirrored(const struct ggml_tensor * tensor);
 

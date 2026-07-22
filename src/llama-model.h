@@ -634,6 +634,12 @@ struct llama_model {
     ggml_backend_dev_t dev_layer(int il) const;
     ggml_backend_dev_t dev_output() const;
 
+    // One-way DeepSeek-V4 transition used after an expert-parallel prefill:
+    // permute the resident routed-expert shards into normal layer-local
+    // tensors using only direct device copies.
+    bool expert_parallel_active() const;
+    bool switch_expert_parallel_to_layer();
+
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;
