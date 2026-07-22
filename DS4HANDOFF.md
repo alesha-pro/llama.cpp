@@ -10,6 +10,19 @@ fast prefill (target 500-800 t/s, currently 495.43 @97K). Naming rule for any
 public text: always "DeepSeek-V4-Flash 284B, 2-bit IQ2_XXS, 87 GB, patched fork"
 — never shorten to "runs DeepSeek V4 locally" without the quant (dunk bait).
 
+## 0. K144 REAP 162B result (2026-07-21)
+
+`0xSero/DeepSeek-V4-Flash-162B-GGUF` was downloaded, SHA-256 verified, and
+validated on this fork at 128K and 256K. K144 support required a fused
+144-expert/top-6 CUDA router case and a dynamic GCD-sized EP relayout unit.
+
+Best hybrid results with `-ts 1,1,1,1`: **500.16 t/s prefill + 31.24 t/s
+clean decode at 129,960 tokens**, and **363.97 t/s prefill + 30.08 t/s clean
+decode at 260,000 tokens**. The 40.816-GiB one-time EP-to-layer permutation
+takes about 2.59 seconds. Peak observed 256K VRAM was only about 14,818 MiB per
+GPU. Full commands, compatibility changes, comparisons, and logs are in
+`DS4_REAP_K144_2026-07-21.md`.
+
 ## 0a. Latest worktree result — fused decode Lightning Indexer (2026-07-10)
 
 Status: implemented and built locally in the `ds4-longctx` worktree; not yet
@@ -138,6 +151,22 @@ Decision: keep expert parallel as an opt-in prefill/offline-batch mode. Do not
 enable it for the interactive server because the per-layer four-GPU
 broadcast/AllReduce dominates single-token decode. Full details and the
 two-GPU pair feasibility test are in `DS4_EXPERT_PARALLEL_2026-07-10.md`.
+
+### Dynamic EP prefill -> layer decode (2026-07-10)
+
+The earlier tradeoff is now removed by the opt-in `DSV4_EP_TO_LAYER=1` path.
+With `DSV4_EXPERT_PARALLEL=1 GGML_CUDA_P2P=1`, the process ingests the prompt
+in EP layout, performs a one-time device-only 12-MiB-block permutation before
+the first decode token, rebuilds the scheduler, and continues in normal layer
+layout. No model reload or host staging is used.
+
+Real 129,960-token validation: **500.18 t/s prefill**, **4.546 s transition**,
+then **31.12 t/s clean decode near 130K**. The prior layer baseline was 381.91
+t/s prefill and about 32.20 t/s warm decode. Net prompt-side saving after the
+transition is about **75.9 seconds** (about **75.3 seconds** through 512 decode
+tokens). Keep production `-ts 1,1,1,0.85`; an
+equal tensor split reduced decode. Full implementation notes and measurements
+are in `DS4_EP_TO_LAYER_2026-07-10.md`.
 
 ## 1. The engine (fork)
 

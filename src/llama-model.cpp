@@ -18,6 +18,7 @@
 #include "models/models.h"
 
 #include "ggml.h"
+#include "../ggml/src/ggml-backend-impl.h"
 #include "ggml-cpp.h"
 
 #include <algorithm>
@@ -33,6 +34,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -975,6 +977,17 @@ struct llama_model::impl {
     layer_dev dev_output = {};
     std::vector<layer_dev> dev_layer;
 
+    struct expert_relayout_source {
+        int il;
+        int slot; // 0=up, 1=gate, 2=down
+        ggml_tensor * meta_tensor;
+        ggml_type type;
+        std::array<int64_t, GGML_MAX_DIMS> ne;
+        std::string name;
+    };
+    std::vector<expert_relayout_source> expert_relayout_sources;
+    bool expert_parallel_active = false;
+
     bool has_tensor_overrides;
 };
 
@@ -1566,6 +1579,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    if (expert_parallel_dev != nullptr) {
+        auto remember = [&](int il, int slot, ggml_tensor * tensor) {
+            GGML_ASSERT(tensor != nullptr);
+            impl::expert_relayout_source source = {};
+            source.il          = il;
+            source.slot        = slot;
+            source.meta_tensor = tensor;
+            source.type        = tensor->type;
+            std::copy(std::begin(tensor->ne), std::end(tensor->ne), source.ne.begin());
+            source.name        = ggml_get_name(tensor);
+            pimpl->expert_relayout_sources.emplace_back(std::move(source));
+        };
+        for (int il = 0; il < n_layer; ++il) {
+            remember(il, 0, layers[il].ffn_up_exps);
+            remember(il, 1, layers[il].ffn_gate_exps);
+            remember(il, 2, layers[il].ffn_down_exps);
+        }
+        pimpl->expert_parallel_active = true;
+    }
+
     return true;
 }
 
@@ -1867,6 +1900,394 @@ ggml_backend_dev_t llama_model::dev_layer(int il) const {
 
 ggml_backend_dev_t llama_model::dev_output() const {
     return pimpl->dev_output.dev;
+}
+
+bool llama_model::expert_parallel_active() const {
+    return pimpl->expert_parallel_active;
+}
+
+bool llama_model::switch_expert_parallel_to_layer() {
+    if (!pimpl->expert_parallel_active) {
+        return true;
+    }
+    if (pimpl->expert_relayout_sources.empty()) {
+        LLAMA_LOG_ERROR("%s: no retained expert tensors\n", __func__);
+        return false;
+    }
+    LLAMA_LOG_INFO("%s: preparing %zu routed-expert tensors\n", __func__, pimpl->expert_relayout_sources.size());
+
+    struct pending_layer {
+        int il = -1;
+        ggml_backend_dev_t dev = nullptr;
+        ggml_context_ptr ctx;
+        size_t device_index = 0;
+        std::vector<std::pair<const impl::expert_relayout_source *, ggml_tensor *>> tensors;
+    };
+
+    std::vector<pending_layer> pending;
+    pending.reserve(layers.size());
+    for (int il = 0; il < (int) layers.size(); ++il) {
+        pending_layer pl;
+        pl.il  = il;
+        pl.dev = pimpl->dev_layer.at(il).dev;
+        ggml_init_params ip = {
+            /*.mem_size   =*/ std::max<size_t>(4096, ggml_tensor_overhead() * 4),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        pl.ctx.reset(ggml_init(ip));
+        if (!pl.ctx) {
+            LLAMA_LOG_ERROR("%s: failed to create tensor context for layer %d\n", __func__, il);
+            return false;
+        }
+        pending.emplace_back(std::move(pl));
+    }
+
+    std::vector<size_t> layer_counts(devices.size(), 0);
+    for (pending_layer & pl : pending) {
+        auto dit = std::find_if(devices.begin(), devices.end(), [&](const llama_device & d) { return d.dev == pl.dev; });
+        GGML_ASSERT(dit != devices.end());
+        pl.device_index = std::distance(devices.begin(), dit);
+        ++layer_counts[pl.device_index];
+    }
+
+    for (const impl::expert_relayout_source & source : pimpl->expert_relayout_sources) {
+        pending_layer & pl = pending.at(source.il);
+        ggml_tensor * tensor = ggml_new_tensor(pl.ctx.get(), source.type, GGML_MAX_DIMS, source.ne.data());
+        ggml_set_name(tensor, source.name.c_str());
+        pl.tensors.emplace_back(&source, tensor);
+    }
+    LLAMA_LOG_INFO("%s: tensor metadata ready, locating reusable expert slabs\n", __func__);
+
+    // Keep the original meta allocation alive. The custom 610 driver faults
+    // if a giant VMM allocation is freed and another allocation follows. Its
+    // four simple buffers become the primary layer-local storage instead.
+    ggml_backend_buffer_t meta_buffer = nullptr;
+    for (auto & ctx_bufs : pimpl->ctxs_bufs) {
+        for (auto & buffer : ctx_bufs.second) {
+            if (ggml_backend_buffer_is_meta(buffer.get())) {
+                meta_buffer = buffer.get();
+                break;
+            }
+        }
+        if (meta_buffer != nullptr) break;
+    }
+    if (meta_buffer == nullptr) {
+        LLAMA_LOG_ERROR("%s: expert meta buffer was not found\n", __func__);
+        return false;
+    }
+
+    std::vector<ggml_backend_buffer_t> base_buffers(devices.size());
+    for (size_t j = 0; j < devices.size(); ++j) {
+        base_buffers[j] = ggml_backend_meta_buffer_simple_buffer(meta_buffer, j);
+        GGML_ASSERT(base_buffers[j] != nullptr);
+    }
+
+    // Use the largest block size that evenly divides every EP shard. The
+    // production 256-expert model yields 12 MiB; REAP-pruned expert counts
+    // such as 144 yield a smaller unit while preserving the same permutation.
+    size_t relayout_unit = 0;
+    for (const impl::expert_relayout_source & source : pimpl->expert_relayout_sources) {
+        for (size_t j = 0; j < devices.size(); ++j) {
+            ggml_tensor * shard = ggml_backend_meta_buffer_simple_tensor(source.meta_tensor, j);
+            if (shard == nullptr || shard->buffer == nullptr) {
+                LLAMA_LOG_ERROR("%s: invalid EP shard %zu for %s\n", __func__, j, source.name.c_str());
+                return false;
+            }
+            relayout_unit = std::gcd(relayout_unit, ggml_nbytes(shard));
+        }
+    }
+    if (relayout_unit == 0) {
+        LLAMA_LOG_ERROR("%s: failed to determine EP relayout unit\n", __func__);
+        return false;
+    }
+    LLAMA_LOG_INFO("%s: using %.2f-MiB relayout unit\n", __func__, relayout_unit / 1024.0 / 1024.0);
+
+    struct tensor_location {
+        pending_layer * layer;
+        size_t tensor_index;
+        size_t size;
+        bool extension = false;
+        ggml_backend_buffer_t extension_buffer = nullptr;
+    };
+    std::vector<ggml_backend_buffer_ptr> extension_buffers;
+    for (size_t j = 0; j < devices.size(); ++j) {
+        ggml_backend_buffer_t base = base_buffers[j];
+        const size_t alignment = ggml_backend_buft_get_alignment(base->buft);
+        std::vector<tensor_location> locations;
+        size_t base_bytes = 0;
+        for (pending_layer & pl : pending) {
+            if (pl.device_index != j) continue;
+            for (size_t i = 0; i < pl.tensors.size(); ++i) {
+                const size_t size = ggml_backend_buft_get_alloc_size(base->buft, pl.tensors[i].second);
+                locations.push_back({ &pl, i, size, false });
+                base_bytes += size;
+            }
+        }
+
+        // Find the smallest whole-tensor spill set. Each tensor is allocated
+        // separately so the custom CUDA 610 allocator never needs another
+        // multi-GiB contiguous allocation after prefill.
+        size_t extension_bytes = 0;
+        if (base_bytes > ggml_backend_buffer_get_size(base)) {
+            const size_t unit = relayout_unit;
+            const size_t need = (base_bytes - ggml_backend_buffer_get_size(base) + unit - 1) / unit;
+            const size_t total_units = base_bytes / unit;
+            std::vector<int> parent_item(total_units + 1, -1);
+            std::vector<int> parent_sum(total_units + 1, -1);
+            parent_item[0] = -2;
+            size_t reachable = 0;
+            for (size_t i = 0; i < locations.size(); ++i) {
+                const size_t units = locations[i].size / unit;
+                for (size_t sum = reachable + 1; sum-- > 0;) {
+                    if (parent_item[sum] == -1 || sum + units > total_units || parent_item[sum + units] != -1) continue;
+                    parent_item[sum + units] = i;
+                    parent_sum[sum + units] = sum;
+                }
+                reachable += units;
+            }
+            size_t spill_units = need;
+            while (spill_units <= total_units && parent_item[spill_units] == -1) ++spill_units;
+            if (spill_units > total_units) {
+                LLAMA_LOG_ERROR("%s: cannot pack routed experts on %s\n", __func__, ggml_backend_dev_name(devices[j].dev));
+                return false;
+            }
+            for (size_t sum = spill_units; sum > 0;) {
+                const int item = parent_item[sum];
+                GGML_ASSERT(item >= 0);
+                locations[item].extension = true;
+                extension_bytes += locations[item].size;
+                sum = parent_sum[sum];
+            }
+        }
+
+        size_t base_offset = 0;
+        for (tensor_location & location : locations) {
+            ggml_backend_buffer_t buffer = base;
+            size_t offset = GGML_PAD(base_offset, alignment);
+            if (location.extension) {
+                extension_buffers.emplace_back(ggml_backend_buft_alloc_buffer(
+                    ggml_backend_dev_buffer_type(devices[j].dev), location.size));
+                if (!extension_buffers.back()) {
+                    LLAMA_LOG_ERROR("%s: failed to allocate %.2f-MiB tensor extension on %s\n", __func__,
+                        location.size / 1024.0 / 1024.0, ggml_backend_dev_name(devices[j].dev));
+                    return false;
+                }
+                ggml_backend_buffer_set_usage(extension_buffers.back().get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                buffer = extension_buffers.back().get();
+                location.extension_buffer = buffer;
+                offset = 0;
+            }
+            ggml_tensor * tensor = location.layer->tensors[location.tensor_index].second;
+            tensor->buffer = buffer;
+            tensor->data = static_cast<uint8_t *>(ggml_backend_buffer_get_base(buffer)) + offset;
+            if (!location.extension) base_offset = offset + location.size;
+            if (ggml_backend_buffer_init_tensor(buffer, tensor) != GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR("%s: failed to initialize storage for %s\n", __func__, ggml_get_name(tensor));
+                return false;
+            }
+        }
+        if (extension_bytes > 0) {
+            LLAMA_LOG_INFO("%s: using %.2f MiB in split extensions on %s (%zu layers)\n", __func__,
+                extension_bytes / 1024.0 / 1024.0, ggml_backend_dev_name(devices[j].dev), layer_counts[j]);
+        }
+    }
+    LLAMA_LOG_INFO("%s: retained slabs and extensions ready, permuting weights with device copies\n", __func__);
+
+    // The EP layout stores one contiguous expert-axis shard on every GPU.
+    // Split both the old and new layouts into their largest common unit, then
+    // perform an in-place permutation. Empty extension slots break most
+    // chains; a single device scratch unit breaks the remaining cycles.
+    const size_t block_size = relayout_unit;
+    struct slot_ref {
+        ggml_backend_buffer_t buffer;
+        uint8_t * data;
+        bool operator==(const slot_ref & other) const {
+            return buffer == other.buffer && data == other.data;
+        }
+    };
+    struct slot_hash {
+        size_t operator()(const slot_ref & slot) const {
+            const size_t h1 = std::hash<void *>{}(slot.buffer);
+            const size_t h2 = std::hash<void *>{}(slot.data);
+            return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+        }
+    };
+    struct relayout_block {
+        slot_ref current;
+        slot_ref destination;
+    };
+
+    std::vector<relayout_block> blocks;
+    size_t total_bytes = 0;
+    for (pending_layer & pl : pending) {
+        for (const auto & item : pl.tensors) {
+            const impl::expert_relayout_source & source = *item.first;
+            ggml_tensor * destination = item.second;
+            size_t destination_offset = 0;
+            for (size_t j = 0; j < devices.size(); ++j) {
+                ggml_tensor * shard = ggml_backend_meta_buffer_simple_tensor(source.meta_tensor, j);
+                if (shard == nullptr || shard->buffer == nullptr || ggml_nbytes(shard) % block_size != 0) {
+                    LLAMA_LOG_ERROR("%s: invalid EP shard %zu for %s\n", __func__, j, source.name.c_str());
+                    return false;
+                }
+                for (size_t offset = 0; offset < ggml_nbytes(shard); offset += block_size) {
+                    blocks.push_back({
+                        { shard->buffer, static_cast<uint8_t *>(shard->data) + offset },
+                        { destination->buffer, static_cast<uint8_t *>(destination->data) + destination_offset + offset },
+                    });
+                }
+                destination_offset += ggml_nbytes(shard);
+            }
+            if (destination_offset != ggml_nbytes(destination)) {
+                LLAMA_LOG_ERROR("%s: EP shards for %s cover %.2f MiB, expected %.2f MiB\n", __func__,
+                    source.name.c_str(), destination_offset / 1024.0 / 1024.0,
+                    ggml_nbytes(destination) / 1024.0 / 1024.0);
+                return false;
+            }
+            total_bytes += destination_offset;
+        }
+    }
+
+    ggml_backend_buffer_ptr scratch {
+        ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(devices.front().dev), block_size)
+    };
+    if (!scratch) {
+        LLAMA_LOG_ERROR("%s: failed to allocate %.2f-MiB permutation scratch buffer\n",
+            __func__, block_size / 1024.0 / 1024.0);
+        return false;
+    }
+    ggml_backend_buffer_set_usage(scratch.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    const slot_ref scratch_slot = { scratch.get(), static_cast<uint8_t *>(ggml_backend_buffer_get_base(scratch.get())) };
+
+    ggml_init_params copy_ip = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * 2,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr copy_ctx { ggml_init(copy_ip) };
+    GGML_ASSERT(copy_ctx);
+    ggml_tensor * copy_src = ggml_new_tensor_1d(copy_ctx.get(), GGML_TYPE_I8, block_size);
+    ggml_tensor * copy_dst = ggml_new_tensor_1d(copy_ctx.get(), GGML_TYPE_I8, block_size);
+    size_t copied_bytes = 0;
+    auto copy_block = [&](const slot_ref & src, const slot_ref & dst) {
+        copy_src->buffer = src.buffer;
+        copy_src->data   = src.data;
+        copy_dst->buffer = dst.buffer;
+        copy_dst->data   = dst.data;
+        if (!ggml_backend_buffer_copy_tensor(copy_src, copy_dst)) {
+            LLAMA_LOG_ERROR("%s: backend rejected device copy %s -> %s\n", __func__,
+                ggml_backend_buffer_name(src.buffer), ggml_backend_buffer_name(dst.buffer));
+            return false;
+        }
+        copied_bytes += block_size;
+        return true;
+    };
+
+    std::unordered_map<slot_ref, size_t, slot_hash> occupant;
+    std::unordered_map<slot_ref, size_t, slot_hash> desired;
+    occupant.reserve(blocks.size() * 2);
+    desired.reserve(blocks.size() * 2);
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        if (!occupant.emplace(blocks[i].current, i).second ||
+            !desired.emplace(blocks[i].destination, i).second) {
+            LLAMA_LOG_ERROR("%s: duplicate source or destination block in permutation\n", __func__);
+            return false;
+        }
+    }
+
+    const int64_t t_start = ggml_time_us();
+    size_t chains = 0;
+    size_t cycles = 0;
+    std::vector<slot_ref> holes;
+    holes.reserve(blocks.size());
+    for (const auto & entry : desired) {
+        if (occupant.find(entry.first) == occupant.end()) holes.push_back(entry.first);
+    }
+    for (slot_ref hole : holes) {
+        if (occupant.find(hole) != occupant.end()) continue;
+        bool moved = false;
+        while (true) {
+            const auto wanted = desired.find(hole);
+            if (wanted == desired.end()) break;
+            const size_t block = wanted->second;
+            const slot_ref old = blocks[block].current;
+            if (!copy_block(old, hole)) return false;
+            occupant.erase(old);
+            occupant[hole] = block;
+            blocks[block].current = hole;
+            hole = old;
+            moved = true;
+        }
+        if (moved) ++chains;
+    }
+
+    for (size_t start = 0; start < blocks.size(); ++start) {
+        if (blocks[start].current == blocks[start].destination) continue;
+        slot_ref hole = blocks[start].current;
+        if (!copy_block(hole, scratch_slot)) return false;
+        occupant.erase(hole);
+        while (true) {
+            const auto wanted = desired.find(hole);
+            GGML_ASSERT(wanted != desired.end());
+            const size_t next = wanted->second;
+            if (next == start) break;
+            const slot_ref old = blocks[next].current;
+            if (!copy_block(old, hole)) return false;
+            occupant.erase(old);
+            occupant[hole] = next;
+            blocks[next].current = hole;
+            hole = old;
+        }
+        if (!copy_block(scratch_slot, hole)) return false;
+        occupant[hole] = start;
+        blocks[start].current = hole;
+        ++cycles;
+    }
+
+    for (const relayout_block & block : blocks) {
+        if (!(block.current == block.destination)) {
+            LLAMA_LOG_ERROR("%s: incomplete device permutation\n", __func__);
+            return false;
+        }
+    }
+
+    for (pending_layer & pl : pending) {
+        for (const auto & item : pl.tensors) {
+            const impl::expert_relayout_source & source = *item.first;
+            ggml_tensor * tensor = item.second;
+            llama_layer & layer = layers[source.il];
+            if (source.slot == 0) layer.ffn_up_exps = tensor;
+            if (source.slot == 1) layer.ffn_gate_exps = tensor;
+            if (source.slot == 2) layer.ffn_down_exps = tensor;
+            for (auto & named : tensors_by_name) {
+                if (named.first == source.name) {
+                    named.second = tensor;
+                    break;
+                }
+            }
+        }
+    }
+
+    bool extensions_stored = false;
+    for (pending_layer & pl : pending) {
+        std::vector<ggml_backend_buffer_ptr> buffers;
+        if (!extensions_stored) {
+            for (ggml_backend_buffer_ptr & buffer : extension_buffers) {
+                if (buffer) buffers.emplace_back(std::move(buffer));
+            }
+            extensions_stored = true;
+        }
+        pimpl->ctxs_bufs.emplace_back(std::move(pl.ctx), std::move(buffers));
+    }
+
+    pimpl->expert_parallel_active = false;
+    const double seconds = (ggml_time_us() - t_start) / 1.0e6;
+    LLAMA_LOG_INFO("%s: switched %.3f GiB of routed experts to layer layout in %.3f s "
+        "(%.3f GiB copied, %.2f GiB/s, %zu chains, %zu cycles)\n", __func__,
+        total_bytes / double(1ull << 30), seconds, copied_bytes / double(1ull << 30),
+        copied_bytes / double(1ull << 30) / seconds, chains, cycles);
+    return true;
 }
 
 template<typename F>

@@ -320,6 +320,10 @@ private:
 
     bool sched_need_reserve = true;
 
+    // DSV4_EP_TO_LAYER: arm the one-way layout switch only after this context
+    // has actually processed a multi-token prompt.
+    bool dsv4_ep_prefill_seen = false;
+
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 

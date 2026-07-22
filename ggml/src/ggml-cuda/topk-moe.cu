@@ -95,7 +95,7 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
     weights += n_expert_used * row;
     ids += n_experts * row;
 
-    constexpr int experts_per_thread = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
+    constexpr int experts_per_thread = (n_experts + WARP_SIZE - 1) / WARP_SIZE;
 
     float wt[experts_per_thread];
 
@@ -305,6 +305,10 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
             topk_moe_cuda<128, has_bias><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used,
                                                                      clamp_val, scale_val, config);
             break;
+        case 144:
+            topk_moe_cuda<144, has_bias><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used,
+                                                                     clamp_val, scale_val, config);
+            break;
         case 256:
             topk_moe_cuda<256, has_bias><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used,
                                                                      clamp_val, scale_val, config);
@@ -375,7 +379,7 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
                                    const ggml_tensor * logits,
                                    const ggml_tensor * ids) {
     const int n_expert = ids->nb[1] / ids->nb[0];
-    if (((n_expert & (n_expert - 1)) != 0 || n_expert > 512) && n_expert != 576) {
+    if (((n_expert & (n_expert - 1)) != 0 || n_expert > 512) && n_expert != 144 && n_expert != 576) {
         return false;
     }
 

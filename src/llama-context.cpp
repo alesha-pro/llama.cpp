@@ -1611,6 +1611,37 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
+    static const bool dsv4_ep_to_layer = std::getenv("DSV4_EP_TO_LAYER") != nullptr;
+    if (dsv4_ep_to_layer && model.expert_parallel_active()) {
+        if (n_tokens_all > 1) {
+            dsv4_ep_prefill_seen = true;
+        } else if (dsv4_ep_prefill_seen) {
+            LLAMA_LOG_INFO("%s: DSV4_EP_TO_LAYER=1 - switching routed experts before first decode token\n", __func__);
+            synchronize();
+            // CUDA graphs and scheduler allocations retain raw pointers to the
+            // expert meta buffer. Destroy them before that 74-GiB buffer is
+            // released; freeing weights first can crash inside libcuda while
+            // graph executables still reference the old addresses.
+            gf_res_prev->reset();
+            gf_res_reserve.reset();
+            sched.reset();
+            if (!const_cast<llama_model &>(model).switch_expert_parallel_to_layer()) {
+                LLAMA_LOG_ERROR("%s: expert layout switch failed\n", __func__);
+                // Keep teardown valid even when a pre-copy allocation fails.
+                // The caller still receives an error and must not continue
+                // inference with a partially transitioned model.
+                const size_t max_nodes = graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
+                gf_res_prev.reset(new llm_graph_result(max_nodes));
+                gf_res_reserve.reset(new llm_graph_result(max_nodes));
+                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                    max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+                sched_need_reserve = true;
+                return -3;
+            }
+            sched_need_reserve = true;
+        }
+    }
+
     if (output_all) {
         // require that all tokens are output
         if (n_outputs_all != n_tokens_all) {
