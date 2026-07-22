@@ -998,7 +998,8 @@ static __global__ void flash_attn_combine_results(
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k,
+    const int warp_size = WARP_SIZE, const bool use_top_k = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1137,7 +1138,9 @@ void launch_fattn(
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
-    const int ntiles_KV = (K->ne[1] + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
+    dsv4_fa_union_buffers & uctx = dsv4_fa_union_ctx();
+    const int64_t n_kv_rows = use_top_k ? (uctx.active ? uctx.cap : top_k->ne[0]) : K->ne[1];
+    const int ntiles_KV = (n_kv_rows + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by rows actually processed.
 
     dim3 blocks_num;
     if (stream_k) {
@@ -1235,8 +1238,7 @@ void launch_fattn(
     }
 
     const int * KV_max_ptr = KV_max.ptr;
-    dsv4_fa_union_buffers & uctx = dsv4_fa_union_ctx();
-    if (top_k && uctx.active) {
+    if (use_top_k && uctx.active) {
         perf_hints.top_k          = (int32_t *) uctx.idx;
         perf_hints.n_top_k        = uctx.cap;
         perf_hints.top_k_memb     = uctx.memb;
