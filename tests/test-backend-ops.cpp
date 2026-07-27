@@ -9125,6 +9125,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32768, 1, 1, 1}, 512));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32779, 1, 1, 1}, 512, true));
 
+    // DSV4 prefill indexer top-k: [n_comp, n_tokens] with n_comp = ctx/ratio-4
+    // and n_tokens = ubatch. These are the multi-row shapes the batched
+    // radix-select path serves; the ties variants matter because masked
+    // positions all carry the same -INF/-1e30 sentinel.
+    for (int64_t n_tokens : {8, 512}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8192,  n_tokens, 1, 1}, 512));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32768, n_tokens, 1, 1}, 512));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32768, n_tokens, 1, 1}, 512, true));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32771, n_tokens, 1, 1}, 512, true));
+    }
+
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {
     //    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {i, 2, 1, 3}, rand() % i + 1));

@@ -141,6 +141,92 @@ static __global__ void top_k_512_radix_compact(
     }
 }
 
+// Exact batched Top-K by radix-select: one CUDA block per row, all four 8-bit
+// passes kept in shared memory.  This exists because the DSV4 *prefill* top-k
+// went through GGML_OP_ARGSORT, which materializes a full [ncols, nrows] i32
+// sort plus CUB temp storage - an allocation that scales with context and ran
+// the 4x3090 rig out of VRAM at ~90K prompt tokens.  Selecting instead of
+// sorting needs no context-scaled scratch at all: the only output is the
+// [k, nrows] index tensor.
+//
+// Same contract as the single-row kernel above: the returned set is exact, its
+// order is unspecified, and GGML_OP_TOP_K does not promise an order.
+static __global__ void top_k_radix_rows(
+        const float * __restrict__ src,
+        int * __restrict__ dst,
+        const int ncols,
+        const int k) {
+    __shared__ unsigned int hist[256];
+    __shared__ unsigned int s_prefix;
+    __shared__ unsigned int s_mask;
+    __shared__ unsigned int s_nabove;
+    __shared__ unsigned int s_ctr_gt;
+    __shared__ unsigned int s_ctr_eq;
+
+    const int     tid  = threadIdx.x;
+    const float * srow = src + (int64_t) blockIdx.x * ncols;
+    int         * drow = dst + (int64_t) blockIdx.x * k;
+
+    if (tid == 0) {
+        s_prefix = 0u;
+        s_mask   = 0u;
+        s_nabove = 0u;
+        s_ctr_gt = 0u;
+        s_ctr_eq = 0u;
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        hist[tid] = 0u;
+        __syncthreads();
+
+        const unsigned int prefix = s_prefix;
+        const unsigned int pmask  = s_mask;
+        for (int i = tid; i < ncols; i += blockDim.x) {
+            const unsigned int key = top_k_ordered_float(srow[i]);
+            if ((key & pmask) == prefix) {
+                atomicAdd(&hist[(key >> shift) & 0xffu], 1u);
+            }
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            const unsigned int need   = (unsigned int) k - s_nabove;
+            unsigned int       higher = 0;
+            for (int b = 255; b >= 0; --b) {
+                const unsigned int count = hist[b];
+                if (higher + count >= need) {
+                    s_prefix |= (unsigned int) b << shift;
+                    s_mask   |= 0xffu << shift;
+                    s_nabove += higher;
+                    break;
+                }
+                higher += count;
+            }
+        }
+        __syncthreads();
+    }
+
+    const unsigned int threshold = s_prefix;
+    const unsigned int n_above   = s_nabove;
+    const unsigned int n_eq_need = (unsigned int) k - n_above;
+    for (int i = tid; i < ncols; i += blockDim.x) {
+        const unsigned int key = top_k_ordered_float(srow[i]);
+        if (key > threshold) {
+            const unsigned int pos = atomicAdd(&s_ctr_gt, 1u);
+            if (pos < (unsigned int) k) {
+                drow[pos] = i;
+            }
+        } else if (key == threshold) {
+            const unsigned int pos = atomicAdd(&s_ctr_eq, 1u);
+            if (pos < n_eq_need) {
+                drow[n_above + pos] = i;
+            }
+        }
+    }
+}
+
 static __global__ void top_k_512_radix_cooperative(
         const float * __restrict__ src,
         int * __restrict__ dst,
@@ -259,6 +345,14 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             top_k_512_radix_choose<<<1, 256, 0, stream>>>(hist, state, nblocks, shift);
         }
         top_k_512_radix_compact<<<nblocks, 256, 0, stream>>>(src0_d, dst_d, (int) ncols, state);
+        return;
+    }
+    // Batched exact select, one block per row. Requires ncols >= k so that the
+    // radix invariant (the chosen prefix always holds at least `need` entries)
+    // holds; below that the caller has nothing to select anyway.
+    if (nrows > 1 && k >= 1 && ncols >= k && ncols >= 512) {
+        top_k_radix_rows<<<(unsigned int) nrows, 256, 0, stream>>>(
+                src0_d, dst_d, (int) ncols, (int) k);
         return;
     }
 #endif

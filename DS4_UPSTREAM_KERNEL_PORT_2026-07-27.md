@@ -457,7 +457,15 @@ than the 284B. That headroom is exactly what the 284B ran out of here, so the
 long-context ceiling does not arise. It has no MTP weights, so nothing is given
 up by dropping MTP.
 
-## 4a. Highest-value follow-up: radix-select for the prefill top-k
+## 4a. Highest-value follow-up: radix-select for the prefill top-k — DONE
+
+**Implemented the same day; see `DS4_PREFILL_RADIX_TOPK_2026-07-27.md`.**
+`DSV4_PREFILL_RADIX_TOPK=1` removes the 90K ceiling: `-ts 1,1,1,0.85` now
+completes the same 104,868-token prompt at 416.48 t/s prefill and 34.587 t/s
+warm decode. The recommendation in section 4 below is written against the
+pre-fix state and is superseded by that document.
+
+The original reasoning, kept as written:
 
 Everything in section 3.3/3.4 traces back to one allocation: the CUB scratch
 inside `ggml_argsort_top_k` on the prefill path. `DSV4_DECODE_RADIX_TOPK`
