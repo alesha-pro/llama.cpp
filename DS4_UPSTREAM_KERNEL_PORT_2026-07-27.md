@@ -390,10 +390,11 @@ Since long context is unavailable to MTP, it was measured where it *is* viable.
 | **MTP** (`--spec-type dsv4-mtp`) | **49.459** | **50.102** |
 | delta | **+26.8%** | **+31.4%** |
 
-So MTP is worth about **+31%** decode when it can be used, on top of the ~5%
-from `DSV4_MMVQ_SMALLK`. Combined with the short-context no-MTP baseline this
-session started from (35.46 t/s), the short-context path is now
-**35.46 -> 50.10 t/s, +41.3%**.
+So MTP is worth about **+31%** decode when it can be used, and it stacks on top
+of the ~5% from `DSV4_MMVQ_SMALLK` (both arms above already have `SMALLK` on).
+No cross-harness comparison is made here: the 35.46 t/s figure in section 3
+comes from `llama-batched-bench` and is not directly comparable to these
+`llama-server` numbers.
 
 That makes the split decision a genuine trade, not a free choice:
 
