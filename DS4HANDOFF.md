@@ -187,6 +187,22 @@ noise). Section 0d below is kept for the diagnosis; its conclusion that MTP and
 long context are mutually exclusive **no longer holds**. Full write-up:
 `DS4_PREFILL_RADIX_TOPK_2026-07-27.md`.
 
+### Use `-ts 1,1,0.90,0.95`, not `1,1,1,0.85`
+
+A second ceiling sits in decode-graph capture: at `1,1,1,0.85` CUDA2 has only
+**10 MiB** free, and a 114,086-token prompt completes prefill and then dies in
+`cudaGraphLaunch`. `-ts 1,1,0.90,0.95` shifts one layer off CUDA2 onto CUDA3
+(same total footprint) and raises the minimum free VRAM from 10 MiB to 684 MiB.
+With it the **full 131,072 context fills**:
+
+| split | ctx | prompt | prefill | decode warm |
+|---|---:|---:|---:|---:|
+| `1,1,1,0.85` | 131072 | 104,868 | 414.20 | 41.624 |
+| `1,1,1,0.85` | 131072 | 114,086 | ok | **decode-graph OOM** |
+| **`1,1,0.90,0.95`** | 131072 | **127,356** | 395.93 | **42.648** |
+
+See `DS4_MAX_CONTEXT_MTP_2026-07-27.md`.
+
 ## 0d. DIAGNOSIS (2026-07-27, superseded by 0e): `-ts 1,1,1,0.85` OOMs at 90K
 
 The launch command in section 4 below pairs `-ts 1,1,1,0.85` with

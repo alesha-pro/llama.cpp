@@ -202,9 +202,12 @@ command OOMs at 90,112 tokens.
 
 ## Caveats and open items
 
-- Validated to ~105K. The configured 131072 and the 262144 case were not
-  re-tested; the argsort allocation is gone but other context-scaled buffers
-  (e.g. the `[1, n_comp, n_tokens]` mask in the dense branch) were not audited.
+- Validated to ~105K. **A follow-up run at 114,086 tokens got through prefill
+  and then failed in decode** — `cudaGraphLaunch` OOM on CUDA2 at
+  `ggml_cuda_graph_evaluate_and_capture`, i.e. the MTP decode graph could not be
+  instantiated in the 10 MiB CUDA2 had left. So this change lifts the *prefill*
+  ceiling, but a second, lower ceiling sits in decode-graph capture. See
+  `DS4_MAX_CONTEXT_MTP_2026-07-27.md`.
 - MTP acceptance rate at depth was not instrumented — only end-to-end
   throughput. The +20.3% is the observable, not a measured accept rate.
 - Output ordering is non-deterministic (atomic compaction), so runs are not
