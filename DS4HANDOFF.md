@@ -168,6 +168,30 @@ tokens). Keep production `-ts 1,1,1,0.85`; an
 equal tensor split reduced decode. Full implementation notes and measurements
 are in `DS4_EP_TO_LAYER_2026-07-10.md`.
 
+## 0d. CORRECTION (2026-07-27): the production `-ts 1,1,1,0.85` cannot do long context
+
+The launch command in section 4 below pairs `-ts 1,1,1,0.85` with
+`--ctx-size 131072`. **That context cannot actually be filled.** Through
+`llama-server` on the full 284B checkpoint, a 104,868-token prompt dies at
+90,112 tokens (86% of prefill) with `CUDA error: out of memory` in
+`cuMemCreate` under `argsort_f32_i32_cuda_cub` on CUDA2 — the prefill top-k
+scratch. Reproduced three times; the equal `-ts 1,1,1,1` split completes the
+same prompt at 410.97 t/s prefill and 34.824 t/s warm decode.
+
+`-ts 1,1,1,0.85` exists only to free GPU3 for the MTP weights, so on this
+checkpoint **MTP and long context are mutually exclusive**. That, not a missing
+measurement, is why "measure MTP at 97K" stayed open since 2026-07-10.
+
+All long-context numbers in section 6 were taken with `llama-batched-bench` at
+`-ts 1,1,1,1`, which is why this never showed up.
+
+MTP measured where it does work (946-token prompt, `-ts 1,1,1,0.85`):
+**38.119 -> 50.102 t/s, +31.4%**.
+
+Details, the refuted context-checkpoint hypothesis, and the recommended fix
+(extend the existing radix-select Top-512 to the prefill shape) are in
+`DS4_UPSTREAM_KERNEL_PORT_2026-07-27.md`.
+
 ## 1. The engine (fork)
 
 - On the rig: `/mnt/ssd/engines/llama.cpp-v4-cchuter`, branch **`ds4-longctx`**.
@@ -268,6 +292,7 @@ never answers), `--repeat-penalty 1.05` (1.2 breaks reasoning), `--ubatch-size 5
 | DSV4_MOE_FUSE=1 | fused up+gate MMQ (shared quantize/ids/bounds) | +0.7% |
 | DSV4_DECODE_FUSED_IDX=1 | fused single-token Lightning Indexer scoring | +16.5% @8K; about +79% @97K vs the prior long-context reference |
 | DSV4_DECODE_RADIX_TOPK=1 | exact cooperative radix-select Top-512 instead of full 32K argsort | 32.593 -> 33.053 raw t/s @129,960 ctx cold (+1.41%); 33.804 warmed sample |
+| DSV4_MMVQ_SMALLK=1 | relax the MMVQ `small_k` trigger from `<` to `<=`; both routed expert matmuls (IQ2_XXS up/gate and Q2_K down) sit exactly on the boundary | **+5.45% decode @pp512, +4.91% @pp8192**, prefill flat (n=3/arm, non-overlapping ranges). See `DS4_UPSTREAM_KERNEL_PORT_2026-07-27.md` |
 
 Follow-up feasibility result: conventional 4-GPU Lightning sharding is rejected. At decode shape, the 32K scan is 55.27 us and exact Top-512 is 34.82 us; 8K local Top-512 is still 33.65 us, so four local selections plus a merge would be launch-bound and slower. Only a fused persistent score+select design remains plausible, with a sub-1-ms/token ceiling; see `DS4_DECODE_RADIX_TOPK_2026-07-10.md`.
 | DSV4_MTP_SPEC=1 + DSV4_MTP_GGUF | MTP speculative decode | decode ×1.2-1.5 |

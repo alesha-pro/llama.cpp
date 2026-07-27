@@ -554,37 +554,35 @@ static __global__ void mul_mat_vec_q(
                     tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);
                 }
             }
-        }
 
-        if (threadIdx.x < rows_per_cuda_block && (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
-            float result = tmp[j][threadIdx.x];
-            if constexpr (has_fusion) {
-                if (use_bias) {
+            // Index tmp/tmp_gate by the compile-time i instead of threadIdx.x so the
+            // accumulators stay in registers; a runtime index forces them to local
+            // memory.  Biases are zero-initialized, so add unconditionally rather
+            // than branching (upstream 683f0c72e).
+            if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
+                float result = tmp[j][i];
+                if constexpr (has_fusion) {
                     result += x_biases[j];
-                }
-                if (use_gate) {
-                    float gate_value = tmp_gate[j][threadIdx.x];
-                    if (use_gate_bias) {
-                        gate_value += gate_biases[j];
-                    }
-                    switch (active_glu) {
-                        case GGML_GLU_OP_SWIGLU:
-                            result *= ggml_cuda_op_silu_single(gate_value);
-                            break;
-                        case GGML_GLU_OP_GEGLU:
-                            result *= ggml_cuda_op_gelu_single(gate_value);
-                            break;
-                        case GGML_GLU_OP_SWIGLU_OAI: {
-                            result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
-                            break;
+                    if (use_gate) {
+                        float gate_value = tmp_gate[j][i] + gate_biases[j];
+                        switch (active_glu) {
+                            case GGML_GLU_OP_SWIGLU:
+                                result *= ggml_cuda_op_silu_single(gate_value);
+                                break;
+                            case GGML_GLU_OP_GEGLU:
+                                result *= ggml_cuda_op_gelu_single(gate_value);
+                                break;
+                            case GGML_GLU_OP_SWIGLU_OAI:
+                                result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                                break;
+                            default:
+                                result = result * gate_value;
+                                break;
                         }
-                        default:
-                            result = result * gate_value;
-                            break;
                     }
                 }
+                dst[j*stride_col_dst + i] = result;
             }
-            dst[j*stride_col_dst + threadIdx.x] = result;
         }
     }
 
@@ -752,7 +750,20 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int     blocks_per_row_x      = ncols_x / qk;
         const int     blocks_per_iter_1warp = vdr * warp_size / qi;
         const int     nwarps                = calc_nwarps(type, c_ncols_dst, table_id);
-        bool          use                   = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
+        // DSV4_MMVQ_SMALLK=1 relaxes the strict "<" to "<=".  The DSV4 routed
+        // up/gate decode matmul lands exactly on the boundary: IQ2_XXS with
+        // ncols_x = n_embd = 4096 gives blocks_per_row_x = 16, and
+        // nwarps*blocks_per_iter_1warp = 4*4 = 16.  At equality the block still
+        // covers all of K in a single loop iteration - the case the comment above
+        // describes - but pays a full cross-warp shared-memory reduction plus
+        // __syncthreads for that one iteration of MAC work.  The small_k variant
+        // gives each block nwarps output rows instead of one, amortizing the
+        // reduction over nwarps times more work at the cost of nwarps times fewer
+        // blocks.  Which side wins is empirical, hence the flag.
+        static const bool smallk_eq = getenv("DSV4_MMVQ_SMALLK") != nullptr;
+        bool          use                   = nwarps > 1 &&
+            (smallk_eq ? blocks_per_row_x <= nwarps * blocks_per_iter_1warp
+                       : blocks_per_row_x <  nwarps * blocks_per_iter_1warp);
 
         constexpr std::array<ggml_type, 2> iq_slow_turing = {
             GGML_TYPE_IQ3_XXS,
