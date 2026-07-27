@@ -298,6 +298,28 @@ static bool dsv4_decode_radix_topk_enabled() {
     return v;
 }
 
+// Exact multi-row radix-select Top-K for PREFILL (env DSV4_PREFILL_RADIX_TOPK=1).
+// The prefill top-k went through ggml_argsort_top_k, i.e. GGML_OP_ARGSORT over
+// the full compressed width followed by a view of the first k. That sorts what
+// only needs selecting, and - the reason this exists - it allocates a
+// [n_comp, n_tokens] i32 result plus CUB temp storage, both of which scale with
+// context. On 4x3090 with -ts 1,1,1,0.85 that allocation failed at ~90K prompt
+// tokens (cuMemCreate OOM inside argsort_f32_i32_cuda_cub), capping usable
+// context well below the configured 131072. GGML_OP_TOP_K allocates only the
+// [k, n_tokens] index tensor and the CUDA backend selects it in-place.
+// Same order caveat as the decode path: the set is exact, the order is not
+// specified, and both consumers (mask scatter, KV gather) are order-invariant.
+static bool dsv4_prefill_radix_topk_enabled() {
+    static const bool v = [] {
+        const bool enabled = getenv("DSV4_PREFILL_RADIX_TOPK") != nullptr;
+        if (enabled) {
+            fprintf(stderr, "dsv4: DSV4_PREFILL_RADIX_TOPK=1 - exact radix-select Top-K for prefill\n");
+        }
+        return enabled;
+    }();
+    return v;
+}
+
 // Indexer-score width bucket (rows) for the gather path: the score/argsort
 // shapes change only every DSV4_CS_BUCKET*ratio tokens (=8192 at ratio 4), so
 // the decode graph replays in between instead of recapturing every boundary.
@@ -2377,7 +2399,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                     cb(index_scores, "indexer_scores", il);
 
                     const int top_k = std::min<int64_t>(hparams.indexer_top_k, n_comp);
-                    ggml_tensor * topk = ggml_argsort_top_k(ctx0, index_scores, top_k);
+                    ggml_tensor * topk = dsv4_prefill_radix_topk_enabled()
+                            ? ggml_top_k(ctx0, index_scores, top_k)
+                            : ggml_argsort_top_k(ctx0, index_scores, top_k);
                     cb(topk, "indexer_topk", il);
 
                     ggml_tensor * comp_mask = dsv4_build_compressed_mask_from_topk(ctx0, index_scores, topk);
@@ -2924,7 +2948,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                 comp_mask = dsv4_new_filled_2d(ctx0, top_k, n_tokens, 0.0f);
                             } else {
                                 const int top_k = std::min<int64_t>(hparams.indexer_top_k, n_comp_visible);
-                                ggml_tensor * topk = ggml_argsort_top_k(ctx0, index_scores, top_k);
+                                ggml_tensor * topk = dsv4_prefill_radix_topk_enabled()
+                                        ? ggml_top_k(ctx0, index_scores, top_k)
+                                        : ggml_argsort_top_k(ctx0, index_scores, top_k);
                                 cb(topk, "indexer_topk", il);
 
                                 // Sparse top-k FA (prompt chunks): the FA kernel's

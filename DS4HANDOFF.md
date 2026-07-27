@@ -168,7 +168,26 @@ tokens). Keep production `-ts 1,1,1,0.85`; an
 equal tensor split reduced decode. Full implementation notes and measurements
 are in `DS4_EP_TO_LAYER_2026-07-10.md`.
 
-## 0d. CORRECTION (2026-07-27): the production `-ts 1,1,1,0.85` cannot do long context
+## 0e. RESOLVED (2026-07-27): MTP + long context now works
+
+`DSV4_PREFILL_RADIX_TOPK=1` replaces the prefill `GGML_OP_ARGSORT` with
+`GGML_OP_TOP_K` backed by a new batched one-block-per-row radix-select, removing
+the context-scaled allocation described in 0d. With it, `-ts 1,1,1,0.85`
+completes a 104,868-token prompt **with MTP enabled**:
+
+| `-ts 1,1,1,0.85`, ~105K prompt | prefill | decode warm |
+|---|---:|---:|
+| before: any config | OOM at 90,112 tokens | — |
+| after, no MTP | 416.48 t/s | 34.587 t/s |
+| **after, MTP** | **414.20 t/s** | **41.624 t/s** |
+
+That is the best long-context decode measured on this fork (prior reference:
+31.2-31.6 t/s at 97K). Prefill speed is unchanged by the flag (+0.5% at 32K,
+noise). Section 0d below is kept for the diagnosis; its conclusion that MTP and
+long context are mutually exclusive **no longer holds**. Full write-up:
+`DS4_PREFILL_RADIX_TOPK_2026-07-27.md`.
+
+## 0d. DIAGNOSIS (2026-07-27, superseded by 0e): `-ts 1,1,1,0.85` OOMs at 90K
 
 The launch command in section 4 below pairs `-ts 1,1,1,0.85` with
 `--ctx-size 131072`. **That context cannot actually be filled.** Through
@@ -293,6 +312,7 @@ never answers), `--repeat-penalty 1.05` (1.2 breaks reasoning), `--ubatch-size 5
 | DSV4_DECODE_FUSED_IDX=1 | fused single-token Lightning Indexer scoring | +16.5% @8K; about +79% @97K vs the prior long-context reference |
 | DSV4_DECODE_RADIX_TOPK=1 | exact cooperative radix-select Top-512 instead of full 32K argsort | 32.593 -> 33.053 raw t/s @129,960 ctx cold (+1.41%); 33.804 warmed sample |
 | DSV4_MMVQ_SMALLK=1 | relax the MMVQ `small_k` trigger from `<` to `<=`; both routed expert matmuls (IQ2_XXS up/gate and Q2_K down) sit exactly on the boundary | **+5.45% decode @pp512, +4.91% @pp8192**, prefill flat (n=3/arm, non-overlapping ranges). See `DS4_UPSTREAM_KERNEL_PORT_2026-07-27.md` |
+| DSV4_PREFILL_RADIX_TOPK=1 | prefill indexer top-k via `GGML_OP_TOP_K` + a batched one-block-per-row radix-select, instead of a full `GGML_OP_ARGSORT` | **removes the 90K prefill OOM ceiling** — `-ts 1,1,1,0.85` now completes 104,868 tokens. Prefill speed neutral (+0.5%). See `DS4_PREFILL_RADIX_TOPK_2026-07-27.md` |
 
 Follow-up feasibility result: conventional 4-GPU Lightning sharding is rejected. At decode shape, the 32K scan is 55.27 us and exact Top-512 is 34.82 us; 8K local Top-512 is still 33.65 us, so four local selections plus a merge would be launch-bound and slower. Only a fused persistent score+select design remains plausible, with a sub-1-ms/token ceiling; see `DS4_DECODE_RADIX_TOPK_2026-07-10.md`.
 | DSV4_MTP_SPEC=1 + DSV4_MTP_GGUF | MTP speculative decode | decode ×1.2-1.5 |
