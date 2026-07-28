@@ -200,7 +200,11 @@ With it the **full 131,072 context fills**:
 | `1,1,1,0.85` | 131072 | 104,868 | 414.20 | 41.624 |
 | `1,1,1,0.85` | 131072 | 114,086 | ok | **decode-graph OOM** |
 | **`1,1,0.90,0.95`** | 131072 | **127,356** | 395.93 | **42.648** |
+| **`1,1,0.90,0.95`** | **163840** | **156,423** | **367.19** | **41.386** |
+| `1,1,0.90,0.95` | 262144 | — | fails at 204,800 | — |
 
+**Max verified context with MTP: 163840** (156K filled, 41.4 t/s decode). 262144
+fails on a depth-scaled compute buffer on CUDA3; projected ceiling ~205-220K.
 See `DS4_MAX_CONTEXT_MTP_2026-07-27.md`.
 
 ## 0d. DIAGNOSIS (2026-07-27, superseded by 0e): `-ts 1,1,1,0.85` OOMs at 90K

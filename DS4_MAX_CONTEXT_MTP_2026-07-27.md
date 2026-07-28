@@ -122,6 +122,67 @@ the compute buffers (they are 286-635 MiB at ubatch 512), freeing on the order
 of 1.5 GiB in aggregate. That may be enough for 262144, at some prefill cost.
 Not attempted here.
 
+### Extrapolating between 131072 and 262144
+
+CUDA3 is the binding device because it carries the ~4,957 MiB of MTP weights:
+
+```
+CUDA3:  24123 total - 17540 model - 4957 MTP = 1626 MiB for KV + compute
+```
+
+KV on CUDA3 is 215 MiB at ctx 131072, i.e. **0.00164 MiB/token**. For the
+compute buffer there is only one deep measurement (1,189.40 MiB at depth
+204,800), so it was extrapolated two ways to bound the answer:
+
+- **A**, purely proportional: `compute = 0.005808 * D`
+- **B**, affine off the 635 MiB load-time value: `compute = 635 + 0.002707 * D`
+
+Requiring `compute(C) + KV(C) <= 1626` to fill a context of size `C`:
+
+| ctx | KV | available | need (A) | margin A | need (B) | margin B |
+|---:|---:|---:|---:|---:|---:|---:|
+| 131072 | 215 | 1411 | 761 | +650 | 990 | +421 |
+| 147456 | 242 | 1384 | 856 | +528 | 1034 | +350 |
+| **163840** | 269 | 1357 | 952 | **+405** | 1078 | **+279** |
+| 174080 | 286 | 1340 | 1011 | +329 | 1106 | +234 |
+| 196608 | 322 | 1304 | 1142 | +162 | 1167 | +137 |
+| 204800 | 336 | 1290 | 1189 | +101 | 1189 | +101 |
+| 262144 | 430 | 1196 | 1523 | **-327** | 1345 | **-149** |
+
+The model reproduces the observed failure rather than being fitted to it after
+the fact: at ctx 262144 the available budget was `1626 - 430 = 1196` MiB against
+a 1,189.40 MiB request — a **+7 MiB** margin, and it failed. That also puts a
+floor on the allocator overhead (old buffer not released before the new one, or
+pool fragmentation): `epsilon >= 7 MiB`.
+
+Predicted fill limit: **~205-220K**, or ~200-210K allowing for fragmentation.
+
+### 163840 measured — fits, as predicted
+
+Same split and flags, `--ctx-size 163840`, 156,423-token prompt:
+
+| ctx | prompt | prefill | decode 64 | decode 128 warm | outcome |
+|---:|---:|---:|---:|---:|---|
+| 131072 | 127,356 | 395.93 | 35.528 | 42.648 | ok |
+| **163840** | **156,423** | **367.19** | 37.948 | **41.386** | **ok, context full** |
+| 262144 | — | fails at 204,800 | — | — | compute-buffer OOM |
+
+The prediction held: 163840 was projected to have 279-405 MiB of margin on CUDA3
+and it completed with no allocation failure. That is now a second confirmation
+of the model (131072 works, 163840 works, 262144 fails where predicted).
+
+Cost of the extra 29K tokens of depth:
+
+- prefill **395.93 -> 367.19 t/s (-7.3%)**;
+- decode **42.648 -> 41.386 t/s (-3.0%)**.
+
+Both degrade gently and roughly in line with the indexer/attention share
+growing with depth. Ingesting the full 156K prompt takes about 7.1 minutes.
+
+**So the practical maximum is 163840 at 41.4 t/s decode**, with 174080 (~170K)
+also projected to fit at a similar margin. 196608 remains the untested boundary
+case (projected margin ~140-160 MiB, versus the +7 MiB that failed).
+
 ### Where this sits historically
 
 | configuration | context reached | decode |
@@ -133,10 +194,11 @@ Not attempted here.
 
 ## Answer
 
-**The maximum context with MTP on the 284B checkpoint is `--ctx-size 131072`,
-and it fills completely.** Measured at 127,356 tokens: **395.93 t/s prefill,
-42.648 t/s warm decode.** 262144 fails at ~205K depth on a compute-buffer
-allocation.
+**The maximum verified context with MTP on the 284B checkpoint is
+`--ctx-size 163840`, and it fills completely** — 156,423 tokens at
+**367.19 t/s prefill and 41.386 t/s warm decode**. 131072 is the faster point
+(395.93 / 42.648) if 128K is enough. 262144 fails at ~205K depth on a
+compute-buffer allocation; the projected ceiling is ~205-220K.
 
 Required launch changes versus `DS4HANDOFF.md` section 4:
 
