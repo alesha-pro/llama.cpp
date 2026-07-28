@@ -43,7 +43,7 @@ The 105K row uses the older `-ts 1,1,1,0.85` split; the two deeper rows use
 - MMVQ `small_k` boundary fix (`DSV4_MMVQ_SMALLK`): both routed expert matmuls land exactly on the `small_k` trigger that a strict `<` excludes — IQ2_XXS up/gate at `4096/256 = 16` blocks against a threshold of 16, Q2_K down at `2048/256 = 8` against 8. Relaxing it to `<=` gives +5% decode with prefill unchanged.
 - Batched radix-select Top-K for prefill (`DSV4_PREFILL_RADIX_TOPK`): the prefill indexer top-k went through `ggml_argsort_top_k`, which fully sorts the compressed width and allocates a `[n_comp, n_tokens]` i32 result plus CUB temp storage — both scaling with context, and both fatal past ~90K tokens. Replaced with a one-block-per-row radix-select behind `GGML_OP_TOP_K` that needs no context-scaled scratch. Same prefill speed, no ceiling.
 
-See [DS4_OPTIMIZATION_2026-07-27.md](DS4_OPTIMIZATION_2026-07-27.md) for the mechanism behind the last two, the full measurements, and the hypotheses that were rejected.
+See [DS4_OPTIMIZATION_2026-07-27.md](DS4_OPTIMIZATION_2026-07-27.md) for the mechanism behind the last two, the full measurements, and the hypotheses that were rejected. [DS4HANDOFF.md](DS4HANDOFF.md) is the consolidated handoff (rig, flags, launch commands); older dated research notes live in [docs/ds4/](docs/ds4/).
 
 ## Production launch
 

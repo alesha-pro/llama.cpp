@@ -310,7 +310,7 @@ Upstream also **removed `-sm row`** entirely (#24216), independently confirming
 the fork's earlier finding that row split is not viable for DSV4, and
 **reverted** its own attempt to reduce scheduler synchronizations (#20793) — so
 no ready-made fix exists upstream for the host-sync overhead documented in
-`DS4_DECODE_UPLIFT_RESEARCH_2026-07-10.md`.
+`docs/ds4/DS4_DECODE_UPLIFT_RESEARCH_2026-07-10.md`.
 
 ---
 
