@@ -1,16 +1,36 @@
-# DeepSeek-V4-Flash 284B on 4x RTX 3090, 128-256K context (ds4-longctx)
+# DeepSeek-V4-Flash 284B on 4x RTX 3090 — 164K context at 41 t/s (ds4-longctx)
 
 This branch runs the full DeepSeek-V4-Flash 284B MoE (2-bit expert GGUF, 87 GB) on four RTX 3090s: 96 GB of VRAM total, sm_86, no FP8, PCIe only. It builds on cchuter's V4 CUDA port. Every change sits behind a `DSV4_*` environment variable; with the flags unset the code paths are stock.
 
-Measured on this box (IQ2_XXS/Q2_K experts, Q8_0 attention, imatrix; 220 W per GPU):
+Measured on this box (IQ2_XXS/Q2_K experts, Q8_0 attention, imatrix; 220 W per GPU).
+Speed against prompt depth, through `llama-server` with the production flag set:
 
-| what | number |
-|---|---|
-| prefill at 97K prompt | 436 t/s |
-| full 253K prompt | 18.4 min (ctx 262144) |
-| needle retrieval from 200K depth | pass |
-| decode, short context, MTP on | 37 t/s (34 without MTP) |
-| decode at 200K depth | 12.3 t/s |
+| prompt depth | prefill | decode, MTP on | decode, no MTP |
+|---:|---:|---:|---:|
+| ~1K | — | **50.1 t/s** | 38.1 t/s |
+| 105K | 414 t/s | **41.6 t/s** | 34.6 t/s |
+| 127K — fills `--ctx-size 131072` | 396 t/s | **42.6 t/s** | — |
+| 156K — fills `--ctx-size 163840` | 367 t/s | **41.4 t/s** | — |
+
+Speculative decoding (MTP) is worth **+31%** at short context and **+20%** at
+depth. Decode degrades gently with depth: 42.6 t/s at 127K, 41.4 t/s at 156K.
+
+Prefill at shallower depths, via `llama-batched-bench`:
+
+| prompt | prefill |
+|---:|---:|
+| 512 | 582 t/s |
+| 8K | 556 t/s |
+| 32K | 487 t/s |
+| 97K | 495 t/s |
+
+**Maximum context with MTP is `--ctx-size 163840`**, verified filled. 262144
+does not fit with MTP loaded — it fails at ~205K depth on a depth-scaled compute
+buffer; the projected ceiling is ~205-220K. Without MTP the branch has completed
+a 253K prompt (ctx 262144) and passes needle retrieval from 200K depth.
+
+The 105K row uses the older `-ts 1,1,1,0.85` split; the two deeper rows use
+`-ts 1,1,0.90,0.95`, which is now the recommended one — see below.
 
 ## What is in the branch
 
@@ -20,21 +40,34 @@ Measured on this box (IQ2_XXS/Q2_K experts, Q8_0 attention, imatrix; 220 W per G
 - Constant-shape decode graphs (`DSV4_CONSTANT_SHAPE`): depth-bucketed shapes so CUDA graphs replay instead of rebuilding every token.
 - MTP speculative decoding, K=1, end to end: the MTP head is side-loaded from a separate GGUF (`DSV4_MTP_GGUF`), drafts are computed inside the main graph, and llama-server picks them up via `--spec-type dsv4-mtp`. Accept rate is 85-100% on greedy decoding.
 - Tool-call fixes for agent clients: the DSML parser now accepts tool parameters in any order. Before this, a well-formed call failed to parse whenever the model ordered parameters differently from the JSON schema, so clients such as opencode never executed the tool.
+- MMVQ `small_k` boundary fix (`DSV4_MMVQ_SMALLK`): both routed expert matmuls land exactly on the `small_k` trigger that a strict `<` excludes — IQ2_XXS up/gate at `4096/256 = 16` blocks against a threshold of 16, Q2_K down at `2048/256 = 8` against 8. Relaxing it to `<=` gives +5% decode with prefill unchanged.
+- Batched radix-select Top-K for prefill (`DSV4_PREFILL_RADIX_TOPK`): the prefill indexer top-k went through `ggml_argsort_top_k`, which fully sorts the compressed width and allocates a `[n_comp, n_tokens]` i32 result plus CUB temp storage — both scaling with context, and both fatal past ~90K tokens. Replaced with a one-block-per-row radix-select behind `GGML_OP_TOP_K` that needs no context-scaled scratch. Same prefill speed, no ceiling.
+
+See [DS4_OPTIMIZATION_2026-07-27.md](DS4_OPTIMIZATION_2026-07-27.md) for the mechanism behind the last two, the full measurements, and the hypotheses that were rejected.
 
 ## Production launch
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 DSV4_CONSTANT_SHAPE=1 DSV4_SPARSE_FA=1 \
-DSV4_IDX_SKIP=1 DSV4_FA_UNION=1 DSV4_MOE_TILE=1 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 GGML_CUDA_P2P=1 \
+DSV4_CONSTANT_SHAPE=1 DSV4_SPARSE_FA=1 DSV4_FA_UNION=1 DSV4_IDX_SKIP=1 \
+DSV4_MOE_TILE=1 DSV4_MOE_RESIDENT=1 DSV4_GLU_FUSE=1 DSV4_MOE_FUSE=1 \
+DSV4_DECODE_FUSED_IDX=1 DSV4_DECODE_RADIX_TOPK=1 \
+DSV4_MMVQ_SMALLK=1 DSV4_PREFILL_RADIX_TOPK=1 \
 DSV4_MTP_SPEC=1 DSV4_MTP_GGUF=/path/to/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf \
 ./llama-server -m DeepSeek-V4-Flash-IQ2XXS-...-imatrix.gguf \
   -ngl 999 --split-mode layer --flash-attn on --no-repack \
-  --ctx-size 131072 --batch-size 4096 --ubatch-size 512 \
-  -ts 1,1,1,0.85 --spec-type dsv4-mtp --parallel 1 \
+  --ctx-size 163840 --batch-size 4096 --ubatch-size 512 \
+  -ts 1,1,0.90,0.95 --spec-type dsv4-mtp --parallel 1 \
   --jinja --reasoning on --reasoning-format deepseek --reasoning-budget 2048
 ```
 
-Notes: tested only on Ampere (CUDA 12.6). `-ts 1,1,1,0.85` frees room on the last GPU for the MTP weights. Agent clients should send `temperature: 0`; sampling at 0.7 on 2-bit weights measurably degrades tool selection, and greedy decoding also keeps the MTP draft gate open.
+Notes: tested only on Ampere (CUDA 12.6).
+
+`DSV4_PREFILL_RADIX_TOPK=1` is **not optional** at long context — without it this command dies at 90,112 prompt tokens in the prefill top-k.
+
+`-ts 1,1,0.90,0.95` replaces the older `1,1,1,0.85`. Both place the same 81,686 MiB of weights, but `1,1,1,0.85` leaves CUDA2 with **10 MiB** free, and the MTP decode graph cannot be instantiated there past ~110K tokens. Shifting one layer off CUDA2 onto CUDA3 raises the minimum free VRAM across devices to 684 MiB and lets the full context fill.
+
+Agent clients should send `temperature: 0`; sampling at 0.7 on 2-bit weights measurably degrades tool selection, and greedy decoding also keeps the MTP draft gate open.
 
 I post benchmarks from this rig on X: [@superalesha](https://x.com/superalesha).
 

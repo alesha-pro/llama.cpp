@@ -168,68 +168,31 @@ tokens). Keep production `-ts 1,1,1,0.85`; an
 equal tensor split reduced decode. Full implementation notes and measurements
 are in `DS4_EP_TO_LAYER_2026-07-10.md`.
 
-## 0e. RESOLVED (2026-07-27): MTP + long context now works
+## 0c2. 2026-07-27 update: +5% decode, and the context ceiling lifted
 
-`DSV4_PREFILL_RADIX_TOPK=1` replaces the prefill `GGML_OP_ARGSORT` with
-`GGML_OP_TOP_K` backed by a new batched one-block-per-row radix-select, removing
-the context-scaled allocation described in 0d. With it, `-ts 1,1,1,0.85`
-completes a 104,868-token prompt **with MTP enabled**:
+Two new flags and one launch correction. Full write-up:
+**`DS4_OPTIMIZATION_2026-07-27.md`**.
 
-| `-ts 1,1,1,0.85`, ~105K prompt | prefill | decode warm |
-|---|---:|---:|
-| before: any config | OOM at 90,112 tokens | — |
-| after, no MTP | 416.48 t/s | 34.587 t/s |
-| **after, MTP** | **414.20 t/s** | **41.624 t/s** |
+| flag / change | effect |
+|---|---|
+| `DSV4_MMVQ_SMALLK=1` | both routed expert matmuls sit exactly on the MMVQ `small_k` boundary that a strict `<` excludes; relaxing it to `<=` gives **+5.45% decode @pp512, +4.91% @pp8192**, prefill flat |
+| `DSV4_PREFILL_RADIX_TOPK=1` | prefill top-k via `GGML_OP_TOP_K` + a batched one-block-per-row radix-select instead of a full `GGML_OP_ARGSORT`; **removes a hard OOM at 90,112 prompt tokens**, prefill speed unchanged |
+| `-ts 1,1,0.90,0.95` | replaces `1,1,1,0.85`; same total footprint, but minimum free VRAM goes **10 MiB -> 684 MiB**, which the MTP decode graph needs at depth |
 
-That is the best long-context decode measured on this fork (prior reference:
-31.2-31.6 t/s at 97K). Prefill speed is unchanged by the flag (+0.5% at 32K,
-noise). Section 0d below is kept for the diagnosis; its conclusion that MTP and
-long context are mutually exclusive **no longer holds**. Full write-up:
-`DS4_PREFILL_RADIX_TOPK_2026-07-27.md`.
+**MTP and long context are no longer mutually exclusive** — that had been open
+since 2026-07-10 not for lack of measurement but because the configuration was
+unsatisfiable.
 
-### Use `-ts 1,1,0.90,0.95`, not `1,1,1,0.85`
+| ctx | prompt | prefill | decode warm (MTP) |
+|---:|---:|---:|---:|
+| 131072 | 127,356 | 395.93 | **42.648** |
+| **163840** | **156,423** | **367.19** | **41.386** |
+| 262144 | — | fails at 204,800 | — |
 
-A second ceiling sits in decode-graph capture: at `1,1,1,0.85` CUDA2 has only
-**10 MiB** free, and a 114,086-token prompt completes prefill and then dies in
-`cudaGraphLaunch`. `-ts 1,1,0.90,0.95` shifts one layer off CUDA2 onto CUDA3
-(same total footprint) and raises the minimum free VRAM from 10 MiB to 684 MiB.
-With it the **full 131,072 context fills**:
-
-| split | ctx | prompt | prefill | decode warm |
-|---|---:|---:|---:|---:|
-| `1,1,1,0.85` | 131072 | 104,868 | 414.20 | 41.624 |
-| `1,1,1,0.85` | 131072 | 114,086 | ok | **decode-graph OOM** |
-| **`1,1,0.90,0.95`** | 131072 | **127,356** | 395.93 | **42.648** |
-| **`1,1,0.90,0.95`** | **163840** | **156,423** | **367.19** | **41.386** |
-| `1,1,0.90,0.95` | 262144 | — | fails at 204,800 | — |
-
-**Max verified context with MTP: 163840** (156K filled, 41.4 t/s decode). 262144
-fails on a depth-scaled compute buffer on CUDA3; projected ceiling ~205-220K.
-See `DS4_MAX_CONTEXT_MTP_2026-07-27.md`.
-
-## 0d. DIAGNOSIS (2026-07-27, superseded by 0e): `-ts 1,1,1,0.85` OOMs at 90K
-
-The launch command in section 4 below pairs `-ts 1,1,1,0.85` with
-`--ctx-size 131072`. **That context cannot actually be filled.** Through
-`llama-server` on the full 284B checkpoint, a 104,868-token prompt dies at
-90,112 tokens (86% of prefill) with `CUDA error: out of memory` in
-`cuMemCreate` under `argsort_f32_i32_cuda_cub` on CUDA2 — the prefill top-k
-scratch. Reproduced three times; the equal `-ts 1,1,1,1` split completes the
-same prompt at 410.97 t/s prefill and 34.824 t/s warm decode.
-
-`-ts 1,1,1,0.85` exists only to free GPU3 for the MTP weights, so on this
-checkpoint **MTP and long context are mutually exclusive**. That, not a missing
-measurement, is why "measure MTP at 97K" stayed open since 2026-07-10.
-
-All long-context numbers in section 6 were taken with `llama-batched-bench` at
-`-ts 1,1,1,1`, which is why this never showed up.
-
-MTP measured where it does work (946-token prompt, `-ts 1,1,1,0.85`):
-**38.119 -> 50.102 t/s, +31.4%**.
-
-Details, the refuted context-checkpoint hypothesis, and the recommended fix
-(extend the existing radix-select Top-512 to the prefill shape) are in
-`DS4_UPSTREAM_KERNEL_PORT_2026-07-27.md`.
+**Max verified context with MTP: 163840.** 262144 fails on a depth-scaled
+compute buffer on CUDA3; projected ceiling ~205-220K. MTP is worth +31% at short
+context and +20% at depth. The launch command in section 4 below is superseded
+by the one in `DS4_OPTIMIZATION_2026-07-27.md`.
 
 ## 1. The engine (fork)
 
