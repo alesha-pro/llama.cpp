@@ -21,7 +21,7 @@ clean decode at 129,960 tokens**, and **363.97 t/s prefill + 30.08 t/s clean
 decode at 260,000 tokens**. The 40.816-GiB one-time EP-to-layer permutation
 takes about 2.59 seconds. Peak observed 256K VRAM was only about 14,818 MiB per
 GPU. Full commands, compatibility changes, comparisons, and logs are in
-`DS4_REAP_K144_2026-07-21.md`.
+`docs/ds4/DS4_REAP_K144_2026-07-21.md`.
 
 ## 0a. Latest worktree result — fused decode Lightning Indexer (2026-07-10)
 
@@ -150,7 +150,7 @@ Fresh same-build full-model A/B at pp512, no MTP:
 Decision: keep expert parallel as an opt-in prefill/offline-batch mode. Do not
 enable it for the interactive server because the per-layer four-GPU
 broadcast/AllReduce dominates single-token decode. Full details and the
-two-GPU pair feasibility test are in `DS4_EXPERT_PARALLEL_2026-07-10.md`.
+two-GPU pair feasibility test are in `docs/ds4/DS4_EXPERT_PARALLEL_2026-07-10.md`.
 
 ### Dynamic EP prefill -> layer decode (2026-07-10)
 
@@ -166,7 +166,7 @@ t/s prefill and about 32.20 t/s warm decode. Net prompt-side saving after the
 transition is about **75.9 seconds** (about **75.3 seconds** through 512 decode
 tokens). Keep production `-ts 1,1,1,0.85`; an
 equal tensor split reduced decode. Full implementation notes and measurements
-are in `DS4_EP_TO_LAYER_2026-07-10.md`.
+are in `docs/ds4/DS4_EP_TO_LAYER_2026-07-10.md`.
 
 ## 0c2. 2026-07-27 update: +5% decode, and the context ceiling lifted
 
@@ -297,7 +297,7 @@ never answers), `--repeat-penalty 1.05` (1.2 breaks reasoning), `--ubatch-size 5
 | DSV4_MMVQ_SMALLK=1 | relax the MMVQ `small_k` trigger from `<` to `<=`; both routed expert matmuls (IQ2_XXS up/gate and Q2_K down) sit exactly on the boundary | **+5.45% decode @pp512, +4.91% @pp8192**, prefill flat (n=3/arm, non-overlapping ranges). See `DS4_UPSTREAM_KERNEL_PORT_2026-07-27.md` |
 | DSV4_PREFILL_RADIX_TOPK=1 | prefill indexer top-k via `GGML_OP_TOP_K` + a batched one-block-per-row radix-select, instead of a full `GGML_OP_ARGSORT` | **removes the 90K prefill OOM ceiling** — `-ts 1,1,1,0.85` now completes 104,868 tokens. Prefill speed neutral (+0.5%). See `DS4_PREFILL_RADIX_TOPK_2026-07-27.md` |
 
-Follow-up feasibility result: conventional 4-GPU Lightning sharding is rejected. At decode shape, the 32K scan is 55.27 us and exact Top-512 is 34.82 us; 8K local Top-512 is still 33.65 us, so four local selections plus a merge would be launch-bound and slower. Only a fused persistent score+select design remains plausible, with a sub-1-ms/token ceiling; see `DS4_DECODE_RADIX_TOPK_2026-07-10.md`.
+Follow-up feasibility result: conventional 4-GPU Lightning sharding is rejected. At decode shape, the 32K scan is 55.27 us and exact Top-512 is 34.82 us; 8K local Top-512 is still 33.65 us, so four local selections plus a merge would be launch-bound and slower. Only a fused persistent score+select design remains plausible, with a sub-1-ms/token ceiling; see `docs/ds4/DS4_DECODE_RADIX_TOPK_2026-07-10.md`.
 | DSV4_MTP_SPEC=1 + DSV4_MTP_GGUF | MTP speculative decode | decode ×1.2-1.5 |
 | DSV4_MTP_EMBD_DEV | (new, 06e8035) place tok_embd mirror device — VRAM valve | — |
 
