@@ -333,7 +333,50 @@ reason these long-context numbers are not reachable upstream.
 
 ---
 
-## 8. Open items
+## 8. Analysed but not run
+
+### `MMVQ_PARAMETERS_TURING` — deprioritized, it would undo part of section 1
+
+Upstream `d7be46189` added a Turing+ nwarps table the fork lacks; Ampere would
+use it. It changes only K-quant shapes at `ncols_dst = 1`, dropping nwarps from
+4 to 2 — which for us means `ffn_down` (Q2_K). That looked like a free port until
+the interaction with `DSV4_MMVQ_SMALLK` was worked out:
+
+| table | nwarps | threshold | blocks/row | `small_k` under `<=` |
+|---|---:|---:|---:|---|
+| GENERIC (current) | 4 | 8 | 8 | **true** |
+| TURING (upstream) | 2 | 4 | 8 | **false** |
+
+`small_k`'s threshold is `nwarps * blocks_per_iter_1warp`, so halving nwarps
+halves the threshold and pushes `ffn_down` back out of the variant that section 1
+measured as a win. The two changes are not independent: adopting the table would
+**undo half of the +5%**, and its own merit at nwarps=2 is unmeasured.
+
+That turns a one-line port into a 2x2 experiment (table x `SMALLK`) needing two
+builds, since the device table id is compile-time and baked into
+`__launch_bounds__`. Not worth it against an unknown while a measured win is on
+the table. Revisit only if the MMVQ decode path is revisited wholesale.
+
+### Agentic round-trip — the measurement gap
+
+Everything measured so far is *one* large prefill plus a decode burst. The actual
+agentic loop is different and has never been profiled here: after the initial
+ingest, each turn appends a tool result (a few hundred to a few thousand tokens)
+and decodes a response, tens of times, against a monotonically growing cache.
+
+Open questions, all cheap to answer once a GPU slot is free:
+
+1. Does `cache_prompt` reuse the whole prefix at depth, or is any of it
+   re-prefilled? A re-prefill at 150K depth would dominate everything else in
+   this document.
+2. What is the per-turn latency breakdown (incremental prefill vs decode) at
+   ~30K, ~100K and ~150K depth?
+3. Do the small incremental prefills (200-3000 tokens) still get the
+   `DSV4_MOE_RESIDENT` / `DSV4_MOE_TILE` paths, which gate on `ne12 >= 64`?
+
+Harness written and ready: `scripts/ds4-agentic-roundtrip.py`.
+
+## 9. Open items
 
 - **196608 context** — projected margin ~140-160 MiB, untested. The only
   remaining question about the ceiling.
