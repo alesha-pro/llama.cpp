@@ -3482,9 +3482,9 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
         const bool changed = memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0;
         if (res || changed) {
-            if (!res && getenv("DSV4_GRAPH_DBG")) {
-                GGML_LOG_INFO("DSV4GDBG: props changed at node %d/%d op=%s name=%s (key=%p uid=%zu)
-",
+            static const bool dsv4_graph_dbg = getenv("DSV4_GRAPH_DBG") != nullptr;
+            if (!res && dsv4_graph_dbg) {
+                GGML_LOG_INFO("DSV4GDBG: props changed at node %d/%d op=%s name=%s (key=%p uid=%zu)\n",
                     i, cgraph->n_nodes, ggml_op_name(cgraph->nodes[i]->op), cgraph->nodes[i]->name,
                     graph_key, (size_t)cgraph->uid);
             }
@@ -4799,7 +4799,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             if (!graph->dsv4_capture_broken) {
                 use_cuda_graph = true;
                 cuda_graph_update_required = true;
-                if (getenv("DSV4_GRAPH_DBG")) {
+                static const bool dsv4_graph_dbg = getenv("DSV4_GRAPH_DBG") != nullptr;
+                if (dsv4_graph_dbg) {
                     static std::atomic<int> n_captures{0};
                     const int c = n_captures.fetch_add(1, std::memory_order_relaxed);
                     if (c < 2 || c % 256 == 0) {
@@ -4814,9 +4815,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
                     graph->warmup_complete = true;
-                    if (getenv("DSV4_GRAPH_DBG")) {
-                        GGML_LOG_INFO("DSV4GDBG: warmup COMPLETE key=%p uid=%zu n=%d first=%s
-",
+                    static const bool dsv4_graph_dbg_c = getenv("DSV4_GRAPH_DBG") != nullptr;
+                    if (dsv4_graph_dbg_c) {
+                        GGML_LOG_INFO("DSV4GDBG: warmup COMPLETE key=%p uid=%zu n=%d first=%s\n",
                             graph_key, (size_t)cgraph->uid, cgraph->n_nodes, cgraph->nodes[0]->name);
                     }
                     use_cuda_graph = true;
@@ -4828,9 +4829,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
-                    if (getenv("DSV4_GRAPH_DBG")) {
-                        GGML_LOG_INFO("DSV4GDBG: warmup RESET key=%p uid=%zu n=%d first=%s
-",
+                    static const bool dsv4_graph_dbg_r = getenv("DSV4_GRAPH_DBG") != nullptr;
+                    if (dsv4_graph_dbg_r) {
+                        GGML_LOG_INFO("DSV4GDBG: warmup RESET key=%p uid=%zu n=%d first=%s\n",
                             graph_key, (size_t)cgraph->uid, cgraph->n_nodes, cgraph->nodes[0]->name);
                     }
                 } else {
