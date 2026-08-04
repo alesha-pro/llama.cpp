@@ -336,6 +336,22 @@ Two caveats, both understood and recorded:
 Sanity: 17*23=391 through 3.7K- and 13.7K-token prefills through the capture
 path, coherent long output, decode text normal across all arms.
 
+**Agent round-trip validation (same night, `scripts/ds4-agentic-roundtrip.py`).**
+The incremental-prefill loop — the pattern none of the day's arms covered —
+immediately found a real B2 bug: ragged batch tails produced ever-new shadow
+keys, each retired cudaGraphExec kept device memory, and GPU2 OOMed at
+cudaGraphLaunch at 120K depth. Fixed in `0e0862d`: one per-device sentinel
+key (exactly one graph + instance alive per device) and instantiate/update/
+launch failures now fall back to direct execution instead of aborting.
+Revalidated worst-case (no checkpoints, full ~130K reprocess per turn, 11
+turns to genuine context overflow): no crash, stable VRAM, decode flat,
+incremental full-reprocess prefills at 1776-1795 t/s. With default context
+checkpoints the loop reprocesses only ~1.4K tokens/turn (the appended chunk)
+at stable 38 t/s decode — **prefix reuse works through the capture path**.
+Ship note: `--ctx-checkpoints 0` was a bench-purity flag; do NOT pass it when
+serving agents — without checkpoints any transcript rollback on this SWA
+model degrades to a full re-prefill.
+
 ## 1. The engine (fork)
 
 - On the rig: `/mnt/ssd/engines/llama.cpp-v4-cchuter`, branch **`ds4-longctx`**.
