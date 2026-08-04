@@ -3383,6 +3383,11 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: disabling CUDA graphs due to split buffer\n", __func__);
 #endif
+            static int dbg_veto_split = 0;
+            if (getenv("DSV4_GRAPH_DBG") && dbg_veto_split++ < 8) {
+                GGML_LOG_INFO("DSV4GDBG: capture veto (split buffer) node=%d op=%s name=%s\n",
+                    i, ggml_op_name(node->op), node->name);
+            }
         }
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
@@ -3393,10 +3398,29 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
-                use_cuda_graph = false;
+                //
+                // DSV4_PREFILL_GRAPHS=1: with the device-resident MoE schedule
+                // (DSV4_MOE_RESIDENT) a large-batch quantized MUL_MAT_ID takes
+                // the MMQ route with device-built expert bounds and no stream
+                // sync, so capture stays legal. The MMVQ (small-batch) and MMQ
+                // routes are both sync-free; only the generic fallback in
+                // ggml_cuda_mul_mat_id syncs, and should_use_mmq rules it out.
+                static const bool dsv4_prefill_graphs = getenv("DSV4_PREFILL_GRAPHS") != nullptr;
+                static const bool dsv4_moe_resident   = getenv("DSV4_MOE_RESIDENT") != nullptr;
+                const bool resident_safe = dsv4_prefill_graphs && dsv4_moe_resident &&
+                    ggml_is_quantized(node->src[0]->type) && node->ne[2] >= 64 &&
+                    ggml_cuda_should_use_mmq(node->src[0]->type, cc, node->src[1]->ne[2], /*n_experts=*/node->src[0]->ne[2]);
+                if (!resident_safe) {
+                    use_cuda_graph = false;
 #ifndef NDEBUG
-                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
+                    GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
+                    static int dbg_veto_mmid = 0;
+                    if (getenv("DSV4_GRAPH_DBG") && dbg_veto_mmid++ < 8) {
+                        GGML_LOG_INFO("DSV4GDBG: capture veto (mul_mat_id) node=%d name=%s type=%s ne2=%lld mmvq_max=%d\n",
+                            i, node->name, ggml_type_name(node->src[0]->type), (long long) node->ne[2], mmvq_mmid_max);
+                    }
+                }
             }
         }
 
@@ -3428,10 +3452,15 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     graph->uid = cgraph->uid;
 
     // Check if the graph size has changed
+    bool resized = false;
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
         res = true;
+        resized = true;
         graph->node_props.resize(cgraph->n_nodes);
     }
+
+    static const bool dsv4_dbg_full = getenv("DSV4_GRAPH_DBG_FULL") != nullptr;
+    int n_changed = 0;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_cuda_graph::node_properties prop = {};
@@ -3445,16 +3474,74 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             }
         }
 
-        if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+        const bool changed = memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0;
+        if (res || changed) {
             if (!res && getenv("DSV4_GRAPH_DBG")) {
                 GGML_LOG_INFO("DSV4GDBG: props changed at node %d/%d op=%s name=%s (key=%p uid=%zu)
 ",
                     i, cgraph->n_nodes, ggml_op_name(cgraph->nodes[i]->op), cgraph->nodes[i]->name,
                     graph_key, (size_t)cgraph->uid);
             }
+            // DSV4_GRAPH_DBG_FULL=1: field-level diff of every changing node.
+            // The union of these fields across a prefill is the exact worklist
+            // for making ubatch graphs capture-stable (bucketing / keying).
+            if (dsv4_dbg_full && changed && !resized) {
+                n_changed++;
+                static std::atomic<int> dbg_budget{240};
+                if (dbg_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+                    const ggml_cuda_graph::node_properties & o = graph->node_props[i];
+                    char f[224] = "";
+                    size_t off = 0;
+                    auto add = [&](const char * s) {
+                        if (off < sizeof(f) - 1) {
+                            off += snprintf(f + off, sizeof(f) - off, "%s ", s);
+                        }
+                    };
+                    if (o.node.data != prop.node.data) {
+                        add("data");
+                    }
+                    if (memcmp(o.node.ne, prop.node.ne, sizeof(prop.node.ne)) != 0) {
+                        add("ne");
+                    }
+                    if (memcmp(o.node.nb, prop.node.nb, sizeof(prop.node.nb)) != 0) {
+                        add("nb");
+                    }
+                    if (memcmp(o.node.op_params, prop.node.op_params, sizeof(prop.node.op_params)) != 0) {
+                        add("op_params");
+                    }
+                    if (o.node.view_offs != prop.node.view_offs) {
+                        add("view_offs");
+                    }
+                    if (memcmp(o.node.src, prop.node.src, sizeof(prop.node.src)) != 0) {
+                        add("src_struct");
+                    }
+                    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                        char b[24];
+                        if (o.node_src_data_ptrs[j] != prop.node_src_data_ptrs[j]) {
+                            snprintf(b, sizeof(b), "s%d.data", j);
+                            add(b);
+                        }
+                        if (memcmp(o.node_src_ne[j], prop.node_src_ne[j], sizeof(prop.node_src_ne[j])) != 0) {
+                            snprintf(b, sizeof(b), "s%d.ne", j);
+                            add(b);
+                        }
+                        if (memcmp(o.node_src_nb[j], prop.node_src_nb[j], sizeof(prop.node_src_nb[j])) != 0) {
+                            snprintf(b, sizeof(b), "s%d.nb", j);
+                            add(b);
+                        }
+                    }
+                    GGML_LOG_INFO("DSV4GDBG-FULL: key=%p node %d op=%s name=%s | %s\n",
+                        graph_key, i, ggml_op_name(cgraph->nodes[i]->op), cgraph->nodes[i]->name, f);
+                }
+            }
             graph->node_props[i] = prop;
             res = true;
         }
+    }
+
+    if (dsv4_dbg_full && !resized && n_changed > 0) {
+        GGML_LOG_INFO("DSV4GDBG-FULL: key=%p uid=%zu changed=%d/%d nodes\n",
+            graph_key, (size_t)cgraph->uid, n_changed, cgraph->n_nodes);
     }
 
     return res;
