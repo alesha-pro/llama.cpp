@@ -3553,7 +3553,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
 #if CUDART_VERSION >= 12000
@@ -3573,12 +3573,19 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         // The pre-existing graph exec cannot be updated (violated constraints,
         // changed kernel functions across width thresholds, ...) - clear the
         // error and re-instantiate. With DSV4_PREFILL_GRAPHS this can happen
-        // on any ubatch, so every update failure must stay recoverable.
+        // on any ubatch, so every update failure must stay recoverable,
+        // including instantiation running out of device memory.
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        const cudaError_t inst_stat = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+        if (inst_stat != cudaSuccess) {
+            (void)cudaGetLastError();
+            graph->instance = nullptr;
+            return false;
+        }
     }
+    return true;
 }
 #endif // USE_CUDA_GRAPH
 
@@ -4685,14 +4692,46 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        bool graph_ok = true;
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            const cudaError_t inst_stat = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+            if (inst_stat != cudaSuccess) {
+                (void) cudaGetLastError();
+                graph->instance = nullptr;
+                graph_ok = false;
+            }
         }
-        if (cuda_graph_update_required) { // Update graph executable
-            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+        if (graph_ok && cuda_graph_update_required) { // Update graph executable
+            graph_ok = ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
-        // Launch graph
-        CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        if (graph_ok) {
+            // Launch graph
+            const cudaError_t launch_stat = cudaGraphLaunch(graph->instance, cuda_ctx->stream());
+            if (launch_stat != cudaSuccess) {
+                (void) cudaGetLastError();
+                graph_ok = false;
+            }
+        }
+        if (!graph_ok) {
+            // Instantiate/update/launch ran out of resources (seen: OOM on the
+            // tightest GPU at 120K depth). The captured work never executed -
+            // drop the graph state and run the nodes directly; the next call
+            // simply tries capture again.
+            static int graph_launch_warned = 0;
+            if (graph_launch_warned++ < 8) {
+                GGML_LOG_WARN("%s: CUDA graph instantiate/launch failed on device %d - executing directly\n",
+                    __func__, cuda_ctx->device);
+            }
+            if (graph->instance != nullptr) {
+                CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+                graph->instance = nullptr;
+            }
+            if (graph->graph != nullptr) {
+                CUDA_CHECK(cudaGraphDestroy(graph->graph));
+                graph->graph = nullptr;
+            }
+            ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, graph_key);
+        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -4746,11 +4785,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             // whole split. Each capture is used exactly once, immediately;
             // the props walk is skipped as pure overhead.
             //
-            // Captures live under a shadow key (key+1): prefill and decode
-            // share nodes[0] on this rig, and overwriting the decode entry's
-            // instance here would make a later warm decode token replay the
-            // prefill graph (silent corruption).
-            graph_key = (const void *) ((const char *) graph_key + 1);
+            // Captures live under a single per-device sentinel key, for two
+            // reasons. (1) Isolation: prefill and decode share nodes[0], and
+            // overwriting the decode entry's instance would make a later warm
+            // decode token replay a prefill graph (silent corruption).
+            // (2) Bounded memory: agent-style traffic produces ragged batch
+            // tails whose first-node addresses vary; keying on them grew the
+            // graph map without limit and every retired cudaGraphExec held
+            // device memory - GPU2 OOMed at cudaGraphLaunch at 120K depth.
+            // One sentinel = exactly one graph + instance alive per device.
+            graph_key = (const void *) (uintptr_t) 0x1;
             graph = cuda_ctx->cuda_graph(graph_key);
             if (!graph->dsv4_capture_broken) {
                 use_cuda_graph = true;
