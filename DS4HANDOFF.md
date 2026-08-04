@@ -301,26 +301,40 @@ warm decode token silently replay a prefill graph. EndCapture failures retire
 the key to direct execution; ExecUpdate failures re-instantiate. The flag is
 in the ship set (`ds4m-serve.sh`); kill switch `GGML_CUDA_DISABLE_GRAPHS=1`.
 
-Same-day ladder vs the srso-off baseline (0731 UD-IQ2_M, ship flags,
-batch 8192, warm medians):
+Same-day ladder (0731 UD-IQ2_M, ship flags, batch 8192, srso off). "no B2" is
+the same-build control with `DSV4_PREFILL_GRAPHS=0`; B2 numbers are
+clean-server warm runs:
 
-| depth | prefill before | prefill after | decode |
-|---:|---:|---:|---:|
-| 32K | 513.5 | **1162** (+126%) | 38.0 (flat) |
-| 98K | 442* | **509** (+15%) | 37.0 |
-| 130K | 404* | **444** (+10%) | 36.1 |
+| depth | no B2 | B2 warm | gain | decode no B2 / B2 |
+|---:|---:|---:|---:|---:|
+| 32K | 513.5 | **1484** | ×2.9 | 37.7 / 38.0 |
+| 98K | 435.9 | **1460** | ×3.35 | 36.97 / 37.02 |
+| 130K | ~444 | **1381** | ×3.1 | — / 36.9 |
 
-(*98K/130K "before" are the morning mitigations-on numbers — no same-day
-srso-off non-B2 arm exists at depth; the srso delta at 32K was +1.9%.)
+That is the section-8 ceiling estimate ("about 3x, implied by summed GPU busy
+time") hit almost exactly. During a warm B2 130K prefill the GPUs sit at
+**93-96% sm, pinned at the 220 W power cap 94% of the time** — the power
+limit is now the binding constraint at depth. Decode is confirmed untouched
+(control arm: 36.97 without B2 vs 37.02 with, same day, same build).
 
-GPU busy during 32K prefill rose from 27-30% to **66-83% active-window mean**
-(peaks 100%). Sanity: 17*23=391 through 3.7K- and 13.7K-token prefills,
-coherent long output. Decode is untouched by design (old path, own keys).
+Two caveats, both understood and recorded:
 
-Why the win shrinks with depth: GPU compute grows with attention width, so
-submission overhead — the thing B2 removes — is a smaller share; and under
-capture the union-FA path self-disables (its 4-byte readback+sync), which
-costs the most exactly at depth. Follow-ups in section 8 / open experiments.
+- **The first request at a new depth still pays the galloc/pool climb** and
+  runs at roughly the old speeds (390 t/s cold at 130K vs 1381 warm). The
+  "auto-warm the sticky plan at startup" item in the list below is thereby
+  promoted: one synthetic deep pass at server start would make every real
+  request run at warm speed.
+- **A degraded state exists and was measured before it was understood**: the
+  first B2 ladder (recorded earlier as 1162/509/444) ran on a server started
+  with `DSV4_GRAPH_DBG=1`, whose 98K/130K runs stayed at cold-like speeds
+  even on repeat. On a clean server the same request sequences give
+  1445-1484 everywhere and the degradation does NOT reproduce. Suspects, in
+  order: the DBG env itself, request-history interaction in galloc/pool.
+  One bisect run (DBG=1 server, 32K x4 then 98K x2, watch for a stuck ~510)
+  settles it. Until then: do not run production with DSV4_GRAPH_DBG=1.
+
+Sanity: 17*23=391 through 3.7K- and 13.7K-token prefills through the capture
+path, coherent long output, decode text normal across all arms.
 
 ## 1. The engine (fork)
 
@@ -483,10 +497,11 @@ Same day, after srso/retbleed off (+1.9% @32K) and capture-always CUDA graphs
 (section 0e):
 
 ```
-32K:   1162 t/s prefill, 38.0 decode     (was 513.5 same-day baseline)
-98K:    509 t/s prefill, 37.0 decode
-130K:   444 t/s prefill, 36.1 decode
-GPU utilisation during prefill: 66-83% active-window mean, peaks 100%
+32K:   1484 t/s prefill, 38.0 decode    (513.5 same-day no-B2 control)
+98K:   1460 t/s prefill, 37.0 decode    (435.9 same-day no-B2 control)
+130K:  1381 t/s prefill, 36.9 decode
+GPU utilisation during warm prefill: 93-96%, power-capped at 220 W 94% of time
+Cold first request per depth still climbs at ~old speeds (390 @130K) - see 0e
 ```
 Historic headline: CPU-fallback fix took prefill 31.6 → 531 t/s (a 23.5K prompt
 from 25 min to 53 sec). This is the "×29" hook of the X thread.
@@ -609,18 +624,22 @@ Two viable designs, in build order:
 
 ### Open experiments (cheap, not yet run)
 
+- **Raise the 220 W power limit** — now the #1 lever: warm B2 prefill pins
+  all four cards at the cap 94% of the time (means 211-216 W). The 3090 is a
+  350 W part; even 260-280 W should move depth prefill directly. Needs
+  `nvidia-smi -pl` (root) and a thermal sanity watch.
+- **Auto-warm the sticky plan + pool at startup** — promoted by 0e: the first
+  request per depth runs ~3.5x slower than warm (390 vs 1381 @130K). One
+  synthetic full-depth pass during server start hides the climb from every
+  real request.
+- **Bisect the DSV4_GRAPH_DBG degraded state** (details in 0e) — one server
+  start answers it; until then just keep DBG off in production.
 - **Capture-safe union-FA** — under capture the union path self-disables (its
-  max_union overflow check is a 4-byte D2H + sync, fattn.cu). Launching the
-  build kernel at the host-known cap and resolving overflow on-device (or
-  accepting cap as the grid and masking) would recover the union win inside
-  captured prefills — worth the most at 98K+ where the gap to the old numbers
-  is smallest.
-- **Depth-decode control arm** — 98K/130K decode reads 37.0/36.1 under B2 vs
-  38.3/37.8 in the morning table, but no same-day non-B2 srso-off arm exists
-  at depth; one `DSV4_PREFILL_GRAPHS=0` server start at 98K settles whether
-  that is noise, the srso/retbleed flags, or a real B2 interaction.
-- **`-ts` rebalancing and the 220 W power limit** — previously pointless at
-  27-30% GPU busy; with prefill now 66-83% busy these are live levers again.
+  max_union overflow check is a 4-byte D2H + sync, fattn.cu). Was estimated
+  from the old +1.3%; with the launch storm gone its true share should be
+  re-measured before investing.
+- **`-ts` rebalancing** — live again now that the GPUs are busy; interacts
+  with the power-limit change, so sweep after it.
 - **Expert parallel together with the 2026-08-04 fixes** — never measured in
   combination. EP alone is +22% prefill / -32% decode; the fixes lift both. If
   the decode penalty stays proportional this is still a prefill-only mode, but

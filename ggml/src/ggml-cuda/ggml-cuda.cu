@@ -3411,7 +3411,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph, bool * dsv4_
                 // sync, so capture stays legal. The MMVQ (small-batch) and MMQ
                 // routes are both sync-free; only the generic fallback in
                 // ggml_cuda_mul_mat_id syncs, and should_use_mmq rules it out.
-                static const bool dsv4_prefill_graphs = getenv("DSV4_PREFILL_GRAPHS") != nullptr;
+                static const bool dsv4_prefill_graphs = getenv("DSV4_PREFILL_GRAPHS") != nullptr && getenv("DSV4_PREFILL_GRAPHS")[0] != '0';
                 static const bool dsv4_moe_resident   = getenv("DSV4_MOE_RESIDENT") != nullptr;
                 const bool resident_safe = dsv4_prefill_graphs && dsv4_moe_resident &&
                     ggml_is_quantized(node->src[0]->type) && node->ne[2] >= 64 &&
@@ -4735,7 +4735,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (graph->is_enabled()) {
         bool dsv4_prefill_batch = false;
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph, &dsv4_prefill_batch);
-        static const bool dsv4_prefill_graphs = getenv("DSV4_PREFILL_GRAPHS") != nullptr;
+        static const bool dsv4_prefill_graphs = getenv("DSV4_PREFILL_GRAPHS") != nullptr && getenv("DSV4_PREFILL_GRAPHS")[0] != '0';
         if (graph_compatible && dsv4_prefill_graphs && dsv4_prefill_batch) {
             // DSV4_PREFILL_GRAPHS capture-always: prefill ubatch properties can
             // never stabilize (input-slot rotation, ARANGE op_params, growing
