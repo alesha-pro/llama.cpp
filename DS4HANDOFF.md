@@ -324,14 +324,16 @@ Two caveats, both understood and recorded:
   "auto-warm the sticky plan at startup" item in the list below is thereby
   promoted: one synthetic deep pass at server start would make every real
   request run at warm speed.
-- **A degraded state exists and was measured before it was understood**: the
-  first B2 ladder (recorded earlier as 1162/509/444) ran on a server started
-  with `DSV4_GRAPH_DBG=1`, whose 98K/130K runs stayed at cold-like speeds
-  even on repeat. On a clean server the same request sequences give
-  1445-1484 everywhere and the degradation does NOT reproduce. Suspects, in
-  order: the DBG env itself, request-history interaction in galloc/pool.
-  One bisect run (DBG=1 server, 32K x4 then 98K x2, watch for a stuck ~510)
-  settles it. Until then: do not run production with DSV4_GRAPH_DBG=1.
+- **The degraded state is SOLVED** (bisect + fix `a7ff920`): trigger was
+  `DSV4_GRAPH_DBG=1`; mechanism was three DSV4GDBG format strings carrying a
+  raw embedded newline byte instead of `\n` — emitted lines never terminated,
+  the server log path accumulated ever-growing glued lines, and processing
+  them throttled the submit thread proportionally to log volume (deep runs
+  emit most, hence 98K stuck at 658 while 32K only sagged). Reproduced on
+  demand (98K 658/664, no warm recovery), then fixed: the same DBG server now
+  runs 98K at **1906 t/s** warm. DBG is safe again; keep it off in prod
+  simply because it is diagnostic noise. The first B2 ladder (1162/509/444)
+  was measured through this bug and understates B2.
 
 Sanity: 17*23=391 through 3.7K- and 13.7K-token prefills through the capture
 path, coherent long output, decode text normal across all arms.
@@ -657,8 +659,8 @@ Two viable designs, in build order:
   request per depth runs ~3.5x slower than warm (390 vs 1381 @130K). One
   synthetic full-depth pass during server start hides the climb from every
   real request.
-- **Bisect the DSV4_GRAPH_DBG degraded state** (details in 0e) — one server
-  start answers it; until then just keep DBG off in production.
+- ~~Bisect the DSV4_GRAPH_DBG degraded state~~ — DONE, fixed (`a7ff920`,
+  details in 0e): unterminated DBG log lines throttled the submit thread.
 - **Capture-safe union-FA** — under capture the union path self-disables (its
   max_union overflow check is a 4-byte D2H + sync, fattn.cu). Was estimated
   from the old +1.3%; with the launch storm gone its true share should be
