@@ -1,6 +1,36 @@
-# DeepSeek-V4-Flash 284B on 4x RTX 3090 — 164K context at 41 t/s (ds4-longctx)
+# DeepSeek-V4-Flash 284B on 4x RTX 3090 — 1,900 t/s prefill, 131K context (ds4-longctx)
 
-This branch runs the full DeepSeek-V4-Flash 284B MoE (2-bit expert GGUF, 87 GB) on four RTX 3090s: 96 GB of VRAM total, sm_86, no FP8, PCIe only. It builds on cchuter's V4 CUDA port. Every change sits behind a `DSV4_*` environment variable; with the flags unset the code paths are stock.
+This branch runs the full DeepSeek-V4-Flash 284B MoE (2-bit expert GGUF, 85-91 GB) on four RTX 3090s: 96 GB of VRAM total, sm_86, no FP8, PCIe only. It builds on cchuter's V4 CUDA port. Every change sits behind a `DSV4_*` environment variable; with the flags unset the code paths are stock.
+
+## 2026-08-04: capture-always CUDA graphs — prefill 433 → 1,900 t/s in one session
+
+Prefill was host-bound: one thread pushing ~1,700 kernel launches per ubatch
+into contended command channels (151 us each) kept four GPUs 27-30% busy.
+`DSV4_PREFILL_GRAPHS=1` skips the CUDA-graph stability gate for prefill
+ubatches and captures every one — launches are recorded host-side, then a
+single `cudaGraphLaunch` submits the whole ~2,200-node split. The GPUs now
+sit at 93-96% and the power limit becomes the binding constraint.
+
+Measured on DeepSeek-V4-Flash-0731 (Unsloth UD-IQ2_M, 91 GB; this quant ships
+no MTP head), `nvidia-smi -pl 350`, warm server:
+
+| prompt depth | prefill | decode |
+|---:|---:|---:|
+| 32K | **1,862 t/s** | 38-40 t/s |
+| 98K | **1,906 t/s** | 37.0 t/s |
+| 130K — fills `--ctx-size 131072` | **1,807-1,823 t/s** | 36.9 t/s |
+
+Same-day controls without the graphs: 513 / 436 / ~444 t/s; decode is
+untouched (36.97 without vs 37.02 with, same build). Power curve at warm
+130K: 220 W → 1,381, 280 W → 1,679, 300 W → 1,742, 350 W → 1,823 t/s. The
+first request at a new depth pays a one-time allocator climb (~550 t/s) —
+start with [scripts/ds4-prod-serve.sh](scripts/ds4-prod-serve.sh), which
+warms it away at startup. Validated end to end: greedy-checkable answers
+through the capture path, an 11-turn agent loop at 115-131K depth, and
+prefix-cache reuse (~1.4K reprocessed tokens per agent turn with default
+context checkpoints).
+
+## Earlier checkpoint: IQ2_XXS + MTP — 164K context at 41 t/s decode
 
 Measured on this box (IQ2_XXS/Q2_K experts, Q8_0 attention, imatrix; 220 W per GPU).
 Speed against prompt depth, through `llama-server` with the production flag set:
@@ -34,6 +64,9 @@ The 105K row uses the older `-ts 1,1,1,0.85` split; the two deeper rows use
 
 ## What is in the branch
 
+- Capture-always CUDA graphs for prefill (`DSV4_PREFILL_GRAPHS`): prefill ubatch graphs can never satisfy the replay stability gate (rotating pipeline input slots, ARANGE op_params, growing indexer shapes), so the backend captures every ubatch and submits it as one graph launch — the per-ubatch submission storm disappears. Exactly one graph + instance alive per device (bounded memory, learned from an agent-loop OOM), instantiate/update/launch failures fall back to direct execution, and decode keeps its own keyed replay path untouched. +2.9-3.4x prefill.
+- Prefill scheduler fixes (`DSV4_STABLE_TOPO`, `GGML_GALLOC_STICKY`): constant prefill graph topology plus grow-only per-family galloc plans — kills a per-ubatch realloc storm that synchronized all backends once per ubatch, and is also what makes graph capture possible at all.
+- `GGML_OP_REPEAT` on I32/I16 runs on CUDA instead of silently falling back to the CPU: removes 172 backend boundaries per graph coming from the 4-way hyper-connections (decode graph splits 364 → 20).
 - Sparse top-k FlashAttention for the CSA prompt chunks (`DSV4_SPARSE_FA`): the FA kernel gathers only the 512 KV positions the lightning indexer selected, with cp.async loads on full tiles and per-Q-tile union lists (`DSV4_FA_UNION`).
 - MoE MMQ tile fix (`DSV4_MOE_TILE`): the ids path sized tiles for the worst-case column bound, which wasted 87% of the MACs at ubatch 512. Sizing from the actual per-expert token count gave +19% end to end. Related finding: IQ2_XXS runs 1.74x faster than Q2_K in MMQ on Ampere.
 - Lightning indexer variants: causal skip (`DSV4_IDX_SKIP`), a q-tiled WMMA kernel for 200K+ depths (`DSV4_IDX_QTILE`).
@@ -46,6 +79,32 @@ The 105K row uses the older `-ts 1,1,1,0.85` split; the two deeper rows use
 See [DS4_OPTIMIZATION_2026-07-27.md](DS4_OPTIMIZATION_2026-07-27.md) for the mechanism behind the last two, the full measurements, and the hypotheses that were rejected. [DS4HANDOFF.md](DS4HANDOFF.md) is the consolidated handoff (rig, flags, launch commands); older dated research notes live in [docs/ds4/](docs/ds4/).
 
 ## Production launch
+
+### Current checkpoint (0731 UD-IQ2_M) — one command, auto-warmed
+
+```bash
+MODEL=/path/to/DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
+bash scripts/ds4-prod-serve.sh
+```
+
+The script starts `llama-server` with the full ship flag set on
+`0.0.0.0:18080`, waits for readiness, then runs one synthetic full-depth
+prefill so the sticky allocator plans and CUDA pools reach their high-water
+marks — after that every request, including the first real one, runs at warm
+speed instead of paying the ~3x allocator climb. `WARM=0` skips the warm
+pass; `MODEL`, `PORT`, `CTX`, `BATCH`, `-ts` and every `DSV4_*` flag are
+overridable from the environment.
+
+Two operational rules learned the hard way:
+
+- do **not** pass `--ctx-checkpoints 0` when serving agents — default context
+  checkpoints are what let a transcript rollback reuse the prefix cache
+  instead of re-prefilling the whole context on this SWA model;
+- the power limit is worth raising (`sudo nvidia-smi -pl 350`, resets at
+  boot): warm prefill is power-bound, and 220 → 350 W is +31% prefill with
+  the cards peaking at 83 C in bursts.
+
+### Earlier checkpoint (IQ2_XXS + MTP)
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 GGML_CUDA_P2P=1 \

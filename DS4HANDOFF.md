@@ -415,7 +415,17 @@ Non-interactive ssh does not source .bashrc (pass HF_TOKEN/HF_HOME/uv explicitly
 Kill processes by exact PID (`lsof -ti :18080`), never `pkill -f` (kills own ssh).
 BMC if hung (address/credentials in the private access note): `ipmitool -C 17 chassis power cycle`.
 
-## 4. Launch commands (scripts live on the rig, verified 2026-07-07)
+## 4. Launch commands
+
+**Current (2026-08-04, 0731 UD-IQ2_M): `bash scripts/ds4-prod-serve.sh`** —
+in-repo, self-contained: full ship flag set (incl. capture-always graphs),
+binds 0.0.0.0:18080, default context checkpoints (agent prefix-reuse), and an
+automatic synthetic full-depth warm pass so the first real request runs at
+warm speed. `WARM=0` skips warming; everything overridable from env. The
+rig-local `~/ds4-sweep/ds4m-serve.sh` remains the A/B harness launcher, and
+`~/ds4-sweep/ds4m-prod.sh` is superseded by the repo script.
+
+### Older checkpoint scripts (on the rig, verified 2026-07-07)
 
 - **`bash /tmp/prod-mtp.sh`** — prod with everything: MTP + all fusions. This is
   the full-fat config.
