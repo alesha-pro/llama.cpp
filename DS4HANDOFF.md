@@ -480,8 +480,16 @@ cudaLaunchKernel. Ranked by expected value:
   replay in between). Instantiate is cheap — 337 us on an 8K-node decode graph.
   Ceiling implied by summed GPU busy time: about **3x the current 520 t/s**,
   i.e. the 700-800 t/s target.
-- **`spec_rstack_overflow=off` as a boot parameter** (Alexey's call, rig-level):
-  removes the AMD srso tax that every one of those yield syscalls pays.
+- **`spec_rstack_overflow=off` — DONE 2026-08-04, kept.** Rebooted with
+  `spec_rstack_overflow=off retbleed=off` (EPYC 7642 is Zen 2, so the retbleed
+  return thunk had to go too; STIBP also relaxed always-on → conditional).
+  Syscall cost collapsed — sched_yield 549 → 162 ns, getpid 195 → 69 ns, vDSO
+  control unchanged — but e2e moved only 503.8 → 513.5 t/s prefill @32K
+  (+1.9%, non-overlapping 3-run warm ranges), decode flat: the spin waits on
+  GPU channel drain, so cheaper syscalls only cut detection latency. Stamped
+  microbench + rerun script: `~/ds4-sweep/srso/` (results.txt, run.sh,
+  after-reboot.sh); harness arms `srso-arm0-32k` / `srso-arm2-32k`. Rollback:
+  restore `/etc/default/grub.bak-2026-08-04` + update-grub.
 - `-ts` rebalancing and raising the 220 W power limit are **not** useful yet:
   at 27-30% utilisation the cards are not the constraint (they draw ~175 W of
   220 under load). Revisit both once the launch path is fixed.
@@ -503,6 +511,57 @@ cudaLaunchKernel. Ranked by expected value:
   needs a perplexity gate — and note this model's down is already IQ3_XXS).
 - External reviews were run via /codex + /opencode (deepseek-v4-pro, kimi, glm)
   through the rig's opencode. codex + glm were most useful on the MTP debug.
+
+### CUDA-graphs recon for prefill (2026-08-04 evening — done, implementation next)
+
+Instrumented and measured at 32K (arm `pg-recon-32k`: 514.1 t/s = baseline,
+patch inert). Two flag-gated changes live uncommitted on
+`kernel-opt-2026-08-04`: `DSV4_PREFILL_GRAPHS=1` lifts the MUL_MAT_ID capture
+veto when the resident MoE route handles the node (mmq, sync-free), and
+`DSV4_GRAPH_DBG_FULL=1` prints a field-level diff of every node whose cached
+graph properties changed.
+
+Facts established:
+
+- prefill runs as only **4 CUDA splits** (one per GPU, 2157-2407 nodes each);
+  the graph keys are stable across ubatches (STABLE_TOPO + STICKY keep the
+  arena addresses fixed), so the keyed-graph map does not fragment;
+- with the veto lifted nothing else fails compatibility — but capture never
+  engages because node properties change **every ubatch** and warmup
+  (2 stable calls) never completes;
+- the churn by field (484 diff lines from one 32K prefill):
+  (a) sched pipeline `copies=4` rotates the split inputs (pos, kq_mask, row
+      indices, hidden state) → `sX.data` changes with period 4;
+  (b) ARANGE nodes bake n_past into `op_params` (3 per CSA layer);
+  (c) compressed-cache writes are CPY-into-VIEW at offset n_past →
+      `data`/`view_offs` walk (main KV uses SET_ROWS and is clean);
+  (d) every `[n_comp]`-shaped indexer/score tensor grows `ne`/`nb` per ubatch
+      (heavy ubatches: ~2000 of ~2200 nodes changed);
+- prefill (n=2231) and decode (n=2198) **collide on the same graph key** (same
+  first-node arena address) and thrash each other's warmup state;
+- the DSV4 kernels are already capture-aware: MOE_TILE readback skips itself
+  under capture, the resident path never syncs, union-FA falls back to
+  per-token under capture (its 4-byte D2H+sync per call is why it cannot be
+  captured as-is; fattn.cu:206-217).
+
+Two viable designs, in build order:
+
+1. **B2 "capture-always"** (recommended first; backend-only). For batch>=64
+   splits skip the stability gate: BeginCapture every ubatch, execute into the
+   graph (launches build host-side — no command-channel submission, no 151 us
+   yield-spins), EndCapture + instantiate (~0.1-0.3 ms at 2.2K nodes) + one
+   cudaGraphLaunch. Per-split submission drops from ~65 ms (~430 launches at
+   151 us contention) to ~1-2 ms. No model-graph changes: ARANGE, views and
+   slot rotation are captured fresh each ubatch. Technical risk: **pool growth
+   during capture** (per-ubatch alloc sizes grow) — needs pool-size grid
+   rounding plus a capture-abort→direct fallback for growth ubatches.
+2. **B1 "stability program"** (classic replay; model surgery). Sanitize the
+   property comparison (drop host struct-pointer noise), key on (nodes[0],
+   n_nodes, copy slot), replace prefill ARANGE with data-driven position
+   inputs, convert compressed-cache writes to SET_ROWS, bucket prefill widths
+   to DSV4_CS_BUCKET (2048 comp rows = 8192 tokens) exactly like decode
+   already does, relax warmup to one visit. Replay fraction 50-87% by bucket.
+   Phase 2 if B2 leaves GPU-busy headroom.
 
 ### Open experiments (cheap, not yet run)
 
