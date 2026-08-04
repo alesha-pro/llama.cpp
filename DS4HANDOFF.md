@@ -194,6 +194,100 @@ compute buffer on CUDA3; projected ceiling ~205-220K. MTP is worth +31% at short
 context and +20% at depth. The launch command in section 4 below is superseded
 by the one in `DS4_OPTIMIZATION_2026-07-27.md`.
 
+## 0d. 2026-08-04: new checkpoint, and prefill turns out to be host-bound
+
+Target changed: **DeepSeek-V4-Flash-0731, Unsloth `UD-IQ2_M`**
+(`/mnt/nvme2/models/DeepSeek-V4-Flash-0731-UD-IQ2_M`, 90.9 GB = 84.7 GiB, ~4 GiB
+larger than the custom IQ2_XXS build). Two things about it matter:
+
+- **It ships no MTP tensors at all** (43 blocks, zero `nextn`/`eh_proj`), and the
+  old MTP GGUF belongs to a different checkpoint, so speculative decode is off
+  the table for this quant unless an MTP head is converted for 0731.
+- **The expert quants differ**: gate/up are IQ2_XXS (42 layers) + IQ2_S (1),
+  down is **IQ3_XXS (41) + MXFP4 (2)** — not Q2_K. The `DSV4_MMVQ_SMALLK`
+  arithmetic in section 0c2 was derived for Q2_K down and no longer describes
+  this model, though the flag stays harmless.
+
+Baseline reproduced exactly against Alexey's own numbers (32K 426.7/36.3,
+98K 411.0/35.6, 131K 384.5/34.5), so all deltas below are honest.
+
+### Two fixes, both about the scheduler rather than the kernels
+
+**1. `GGML_OP_REPEAT` on I32 was running on the CPU backend** (commit `2df82c3`).
+The CUDA backend declined REPEAT for I32/I16, so `ggml_backend_sched` placed
+every such node on the CPU: 172 nodes per graph, four per layer, from the 4-way
+hyper-connections. Each one is a backend boundary — a stream synchronise plus a
+D2H and an H2D copy. Decode graph splits **364 -> 20**, CPU splits **176 -> 4**,
+matching the ~208 `cudaStreamSynchronize` per token seen in Nsight. The float
+`bin_bcast` path is not reusable (it funnels values through `float`, lossy above
+2^24), so this adds a dedicated broadcast-copy kernel. `test-backend-ops -o
+REPEAT` 14/14. **decode +6.3% @32K, +5.8% @98K**, prefill flat.
+
+**2. A per-ubatch galloc realloc storm serialised prefill** (commit `a21ad15`).
+A 32K prefill paid **70 scheduler reallocations, one per ubatch**, and the
+realloc path begins by synchronising *all* backends — so the ubatch pipeline
+(`sched copies = 4`) never engaged. Two independent causes:
+
+- `DSV4_STABLE_TOPO=1` — `dsv4_pad_fattn_width` emitted its FILL+CONCAT pad pair
+  only when the FA width was unaligned, so consecutive 512-token ubatches
+  alternated topology (42 node pairs appearing and disappearing) and backend ids
+  never matched. An aligned width now pads a full 256 tile under the usual -INF
+  mask.
+- `GGML_GALLOC_STICKY=1` — the galloc plan is replaced wholesale on every
+  reserve, so monotone DSV4 extent growth plus prefill/decode family switching
+  re-planned every ubatch. Each `(n_nodes, n_leafs)` family now keeps grow-only
+  high-water slot sizes; after one warming pass every later graph of that family
+  fits the resident plan. Also records the actual planned block size in
+  `hash_node.alloc_size` and frees exactly that (the raw-size free was a latent
+  mismatch).
+
+Ship configuration (both flags + `--batch-size 8192 --ctx-checkpoints 0`),
+UD-IQ2_M, `--ctx-size 131072`, after one plan-warming request:
+
+| depth | prefill before | prefill after | decode before | decode after |
+|---:|---:|---:|---:|---:|
+| 32K | 433.8 | **511-521** (+19%) | 35.9 | **39.4** (+9%) |
+| 98K | 410.9 | **442** (+7.6%) | 35.4 | **38.3** (+8%) |
+| 131K | 384.5 | **404** (+5.0%) | 34.5 | **37.8** (+9.7%) |
+
+The first request at a new depth after a server start still pays the climb
+reallocs once; everything after it runs on the resident plan.
+
+### Where prefill actually stands now (the important part)
+
+After the fix, ALL-IDLE fell **51.6% -> 4.1%** and the overlap factor rose
+1.00x -> **1.149x** — but each GPU is still only **27-30% busy**. The reason is
+no longer the scheduler:
+
+```
+520 t/s  <- host thread pinned at 99% CPU
+  +- 18.3 s of a 20 s window inside cudaLaunchKernel (121K launches, 151 us each)
+       +- perf: >60% of its cycles are the sched_yield syscall machinery
+            (libcuda yield-spins waiting for command-channel space;
+             the AMD srso mitigation taxes every syscall)
+                 +- channels stay full because the work is a serial
+                    GPU0->1->2->3 layer chain
+```
+
+Ruled out by measurement, all of them plausible beforehand: **P2P** (`GGML_CUDA_P2P`
+0 vs 1: 511.2 vs 511.3), **GSP idle-wake** (busy GPUs cost the same to submit as
+idle ones), **NVML pollers** (killing nvtop and a polling nvidia-smi: <1%),
+**`cudaDeviceScheduleSpin`** (511.9 — spinning waits just as long; patch
+reverted), **`--ubatch-size 1024`** (495.8 — launch count scales with tokens,
+not with ubatch).
+
+Rig-level microbenchmark, empty kernels, **idle cards**: 3.0 us per launch on
+one GPU and the same round-robin across four — so 151 us/launch is contention
+under real load, not a driver constant. Caveat learned the hard way: run these
+only when the rig is free. A second CUDA process alongside llama-server measures
+1270-2520 us/launch and floods dmesg with `GspRmAlloc failed ... status=0x4f` on
+GPU1 — channel exhaustion, **not** faulty hardware (the card gives 3 us and zero
+errors once the rig is idle).
+
+Diagnostics used are still in the tree behind `GGML_SYNCLOG=1`: `[SYNCLOG]`
+counters for realloc / sched-sync / ctx-sync and `[GALLOCFAIL]` lines naming the
+first node whose planned size was exceeded.
+
 ## 1. The engine (fork)
 
 - On the rig: `/mnt/ssd/engines/llama.cpp-v4-cchuter`, branch **`ds4-longctx`**.
@@ -212,7 +306,13 @@ by the one in `DS4_OPTIMIZATION_2026-07-27.md`.
 - All optimizations are behind `DSV4_*` env flags; flags unset = stock path.
 
 ### Commit history = the optimization path (newest first)
+
+Branch `kernel-opt-2026-08-04` carries the two newest commits; everything below
+them is on `ds4-longctx`.
 ```
+a21ad15 prefill: stop the per-ubatch galloc realloc storm (DSV4_STABLE_TOPO + GGML_GALLOC_STICKY)  ★
+2df82c3 cuda: run GGML_OP_REPEAT on I32/I16 instead of falling back to the CPU  ★
+7b09cda docs+tools: agentic round-trip harness; TURING table analysed and deprioritized
 06e8035 deepseek4: DSV4_MTP_EMBD_DEV env to place the tok_embd mirror (VRAM valve)
 753e52e chat/grammar: survive huge schema bounds, trigger DSML grammar on prefix
 cfeac53 deepseek4: mirror token embedding onto MTP device for candidate lookup
@@ -301,8 +401,28 @@ Follow-up feasibility result: conventional 4-GPU Lightning sharding is rejected.
 | DSV4_MTP_SPEC=1 + DSV4_MTP_GGUF | MTP speculative decode | decode ×1.2-1.5 |
 | DSV4_MTP_EMBD_DEV | (new, 06e8035) place tok_embd mirror device — VRAM valve | — |
 
-Diagnostic-only: DSV4_UNION_STATS, DSV4_IDX_QTILE (for 200K+), DSV4_IDX_F16ACC
-(negative), kill-switches DSV4_NO_TOPK_GATHER / DSV4_NO_LIGHTNING_IDX.
+| DSV4_STABLE_TOPO=1 | (2026-08-04) constant prefill graph topology: pad the FA width even when already aligned | part of prefill +19% |
+| GGML_GALLOC_STICKY=1 | (2026-08-04) grow-only galloc plan per graph family; kills the per-ubatch realloc + all-GPU drain | part of prefill +19% |
+| GGML_SYNCLOG=1 | (2026-08-04) diagnostic: [SYNCLOG] realloc/sched-sync/ctx-sync counters + [GALLOCFAIL] node that overflowed the plan | — |
+| DSV4_RESERVE_FULL=1 | (2026-08-04) reserve the deep-prefill plan at n_ctx - n_ubatch; superseded by the sticky plan | neutral |
+| GGML_GALLOC_PAD=1 | (2026-08-04) grid-round planned sizes (max +19% headroom); partial, superseded by sticky | partial |
+
+Diagnostic-only: DSV4_UNION_STATS, kill-switches DSV4_NO_TOPK_GATHER /
+DSV4_NO_LIGHTNING_IDX.
+
+Measured **negative on 0731 UD-IQ2_M** (32K, control arm 420.4): DSV4_IDX_QTILE
+-4.0%, DSV4_IDX_F16ACC -4.8%, both together -8.7%, DSV4_MOE_RESIDENT_TILE=8
+-13.1% (tile 32 was +2.4%, inside the ~3% between-restart noise), ubatch 1024
+-3.4%, ubatch 2048 aborts in graph_reserve. The lightning indexer is close to
+the hardware ceiling here — with causal skip it runs at roughly 37 TFLOPS
+against the 71 TFLOPS FP16-with-FP32-accumulate limit of a 3090, which is why
+its alternative kernels cannot win.
+
+Expert parallel re-measured on this checkpoint: `DSV4_EXPERT_PARALLEL=1` gives
+**+22% prefill** (531 vs 434 @32K, 501 vs 411 @98K) for **-32% decode** — an
+honest trade, not a free win. `DSV4_EP_TO_LAYER=1` speeds up only the *first*
+ingest (529 t/s), then reverts to layer-split rates, so it is a one-off saving
+of ~70 s on a 130K ingest.
 
 ## 6. Current numbers (measured on the 4×3090 rig)
 
@@ -312,6 +432,17 @@ PREFILL @253K: 256.7 t/s, full 253369-tok prompt in 16.5 min, needle @200K PASS
 PREFILL @32K (live agent request): 400.9 t/s
 DECODE:        15-18 (raw fork) → 33.49 @8K / 31.23-31.60 @97K fused indexer, no MTP
                current equal-split server: 35.699 @595 ctx; 32.593 baseline / 33.053 radix @129,960 ctx
+```
+
+2026-08-04, **0731 UD-IQ2_M** (different checkpoint and quant mix — not
+comparable to the rows above), ship flags + batch 8192 + `--ctx-checkpoints 0`,
+no MTP, after one plan-warming request:
+
+```
+32K:   511-521 t/s prefill, 39.4-39.5 t/s decode
+98K:   442 t/s prefill,     38.3 t/s decode
+131K:  404 t/s prefill,     37.8 t/s decode
+GPU utilisation during prefill: 27-30% per card - host-bound on kernel submission
 ```
 Historic headline: CPU-fallback fix took prefill 31.6 → 531 t/s (a 23.5K prompt
 from 25 min to 53 sec). This is the "×29" hook of the X thread.
@@ -335,14 +466,28 @@ from 25 min to 53 sec). This is the "×29" hook of the X thread.
    real decode (859e602); proper fix later = mirror tok_embd onto MTP device
    (cfeac53) + DSV4_MTP_EMBD_DEV (06e8035).
 
-## 8. Further prefill work (the 500 t/s target is now within 0.9%)
+## 8. Further prefill work (next: CUDA graphs for prefill ubatches)
 
-- Strategy A: fused-kernel dual accumulation in mmq.cuh (load q8_1 activation
-  once, up+gate weights serially, two accumulators, swiglu_clamp epilogue; v1
-  without stream-k). Est +4-8%. Highest-effort, hottest kernel.
-- Requant down Q2_K → IQ2_XXS: +5-7% near-zero-code (IQ2_XXS 1.74× faster), but
-  down is quality-sensitive — needs a perplexity gate + Russian-reasoning check.
-  This is Alexey's call.
+Superseding the older plan below: as of 2026-08-04 prefill is **host-bound on
+kernel submission** (section 0d), so kernel-level work cannot move it. The GPUs
+are 27-30% busy and the host thread spends its cycles yield-spinning inside
+cudaLaunchKernel. Ranked by expected value:
+
+- **CUDA graphs for prefill ubatches** — the one structural fix. One
+  `cudaGraphLaunch` per split instead of ~1500 individual launches; decode
+  already does this. Shapes must be bucketed the way `DSV4_CS_BUCKET` buckets
+  the decode masks (pad masks/views to a multiple, re-capture once per bucket,
+  replay in between). Instantiate is cheap — 337 us on an 8K-node decode graph.
+  Ceiling implied by summed GPU busy time: about **3x the current 520 t/s**,
+  i.e. the 700-800 t/s target.
+- **`spec_rstack_overflow=off` as a boot parameter** (Alexey's call, rig-level):
+  removes the AMD srso tax that every one of those yield syscalls pays.
+- `-ts` rebalancing and raising the 220 W power limit are **not** useful yet:
+  at 27-30% utilisation the cards are not the constraint (they draw ~175 W of
+  220 under load). Revisit both once the launch path is fixed.
+- Older ideas, still valid but smaller: fused-kernel dual accumulation in
+  mmq.cuh (est +4-8%), and requanting down to IQ2_XXS (+5-7%, quality-sensitive,
+  needs a perplexity gate — and note this model's down is already IQ3_XXS).
 - External reviews were run via /codex + /opencode (deepseek-v4-pro, kimi, glm)
   through the rig's opencode. codex + glm were most useful on the MTP debug.
 
