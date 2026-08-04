@@ -390,7 +390,78 @@ static void ggml_cuda_op_bin_bcast(
     }
 }
 
+// Broadcast-copy for integer payloads (GGML_OP_REPEAT on I32/I16).
+//
+// Kept separate from the float bin_bcast path on purpose: that path converts
+// every element to float, which is lossy for integers above 2^24. Here the
+// payload is copied bit-for-bit. Without this the scheduler has to place these
+// nodes on the CPU backend, and each placement costs a graph split - 172 of
+// them per DeepSeek-V4 graph.
+template <typename T>
+static __global__ void k_repeat_int(
+        const T * __restrict__ src, T * __restrict__ dst,
+        const int ne00, const int ne01, const int ne02, const int ne03,
+        const int ne0,  const int ne1,  const int ne2,  const int ne3,
+        const int s00,  const int s01,  const int s02,  const int s03,
+        const int s0,   const int s1,   const int s2,   const int s3) {
+
+    const int64_t idx   = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t total = (int64_t) ne0*ne1*ne2*ne3;
+    if (idx >= total) {
+        return;
+    }
+
+    const int i0 = (int) ( idx                        % ne0);
+    const int i1 = (int) ((idx / ne0)                 % ne1);
+    const int i2 = (int) ((idx / ((int64_t) ne0*ne1)) % ne2);
+    const int i3 = (int) ( idx / ((int64_t) ne0*ne1*ne2));
+
+    const int64_t src_off = (int64_t) (i0 % ne00)*s00 + (int64_t) (i1 % ne01)*s01
+                          + (int64_t) (i2 % ne02)*s02 + (int64_t) (i3 % ne03)*s03;
+    const int64_t dst_off = (int64_t) i0*s0 + (int64_t) i1*s1
+                          + (int64_t) i2*s2 + (int64_t) i3*s3;
+
+    dst[dst_off] = src[src_off];
+}
+
+template <typename T>
+static void repeat_int_cuda(const ggml_tensor * src0, ggml_tensor * dst, cudaStream_t stream) {
+    const int64_t total = ggml_nelements(dst);
+    if (total == 0) {
+        return;
+    }
+
+    // strides in elements, not bytes
+    const int s00 = (int) (src0->nb[0]/sizeof(T)), s01 = (int) (src0->nb[1]/sizeof(T));
+    const int s02 = (int) (src0->nb[2]/sizeof(T)), s03 = (int) (src0->nb[3]/sizeof(T));
+    const int s0  = (int) (dst->nb[0]/sizeof(T)),  s1  = (int) (dst->nb[1]/sizeof(T));
+    const int s2  = (int) (dst->nb[2]/sizeof(T)),  s3  = (int) (dst->nb[3]/sizeof(T));
+
+    const int block = 256;
+    const int64_t grid = (total + block - 1)/block;
+    GGML_ASSERT(grid <= INT_MAX);
+
+    k_repeat_int<T><<<(int) grid, block, 0, stream>>>(
+        (const T *) src0->data, (T *) dst->data,
+        (int) src0->ne[0], (int) src0->ne[1], (int) src0->ne[2], (int) src0->ne[3],
+        (int) dst->ne[0],  (int) dst->ne[1],  (int) dst->ne[2],  (int) dst->ne[3],
+        s00, s01, s02, s03, s0, s1, s2, s3);
+}
+
 void ggml_cuda_op_repeat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    if (src0->type == GGML_TYPE_I32 || src0->type == GGML_TYPE_I16) {
+        GGML_ASSERT(src0->type == dst->type);
+        GGML_ASSERT(ggml_can_repeat(src0, dst));
+        if (src0->type == GGML_TYPE_I32) {
+            repeat_int_cuda<int32_t>(src0, dst, ctx.stream());
+        } else {
+            repeat_int_cuda<int16_t>(src0, dst, ctx.stream());
+        }
+        return;
+    }
+
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_repeat, 0>>(dst, dst->src[0], dst, nullptr, dst->src[0]->data, dst->data, ctx.stream());
 }
 

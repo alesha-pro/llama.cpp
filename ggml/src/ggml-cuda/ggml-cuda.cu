@@ -5467,7 +5467,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_REPEAT:
             {
                 ggml_type src0_type = op->src[0]->type;
-                return src0_type != GGML_TYPE_I32 && src0_type != GGML_TYPE_I16;
+                // I32/I16 go through a dedicated broadcast-copy kernel; leaving
+                // them to the CPU backend costs one graph split per node, which
+                // dominates decode latency on multi-GPU MoE models.
+                if (src0_type == GGML_TYPE_I32 || src0_type == GGML_TYPE_I16) {
+                    return op->type == src0_type;
+                }
+                return true;
             } break;
         case GGML_OP_REPEAT_BACK:
                 return op->type == GGML_TYPE_F32 && (op->src[0]->ne[2]*op->src[0]->ne[3]) <= (1 << 15);

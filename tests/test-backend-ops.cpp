@@ -9595,6 +9595,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
 
+    // DeepSeek-V4-Flash 0731 (UD-IQ2_M): 256 experts, top-6, n_embd 4096, n_ff_exp 2048.
+    // bs=1 is the decode shape that dominates this model's token latency.
+    for (int bs : {1, 2, 4, 8, 16, 512}) {
+        for (ggml_type type_b : {GGML_TYPE_F32}) {
+            // routed gate/up  [k=4096, m=2048, 256 experts]
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, type_b, 256, 6, false, 2048, bs, 4096));
+            // routed down     [k=2048, m=4096, 256 experts]
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, type_b, 256, 6, false, 4096, bs, 2048));
+        }
+    }
+
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
         for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
