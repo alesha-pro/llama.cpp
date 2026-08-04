@@ -1534,6 +1534,13 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+        {
+            static int synclog_realloc_n = 0;
+            if (getenv("GGML_SYNCLOG") != NULL) {
+            GGML_LOG_INFO("[SYNCLOG] realloc #%d t=%.3f nodes=%d leafs=%d ids_changed=%d\n",
+                ++synclog_realloc_n, ggml_time_us()/1e6, sched->graph.n_nodes, sched->graph.n_leafs, (int) backend_ids_changed);
+            }
+        }
         for (int i = 0; i < sched->n_backends; i++) {
             ggml_backend_synchronize(sched->backends[i]);
         }
@@ -1912,6 +1919,12 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
+    {
+        static int synclog_sched_n = 0;
+        if (getenv("GGML_SYNCLOG") != NULL) {
+        GGML_LOG_INFO("[SYNCLOG] schedsync #%d t=%.3f\n", ++synclog_sched_n, ggml_time_us()/1e6);
+        }
+    }
     GGML_ASSERT(sched);
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);

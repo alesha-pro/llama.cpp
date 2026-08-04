@@ -585,7 +585,12 @@ void llama_context::sched_reserve() {
     // DeepSeek V4 resumed-prompt chunks use the compressed-attention decode
     // graph, which is larger than the position-zero prefill graph.
     if (model.arch == LLM_ARCH_DEEPSEEK4 && n_tokens > 1) {
-        const llama_pos reserve_pos0 = std::min<llama_pos>(
+        // DSV4_RESERVE_FULL: plan for the deepest possible ubatch so the
+        // resident galloc plan covers the whole session (see header note).
+        static const bool dsv4_reserve_full = getenv("DSV4_RESERVE_FULL") != nullptr;
+        const llama_pos reserve_pos0 = dsv4_reserve_full
+            ? (cparams.n_ctx > n_tokens ? (llama_pos) (cparams.n_ctx - n_tokens) : (llama_pos) n_tokens)
+            : std::min<llama_pos>(
                 cparams.n_ctx > n_tokens ? cparams.n_ctx - n_tokens : n_tokens,
                 std::max<uint32_t>(cparams.n_batch, 8u*n_tokens));
         auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(),
@@ -615,7 +620,13 @@ void llama_context::sched_reserve() {
         //
         // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
         //
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(), model.hparams.no_alloc);
+        // DSV4_RESERVE_FULL: the resident plan is whatever was reserved LAST,
+        // so for DSV4 repeat the deep-position prefill reserve here - a
+        // position-0 plan would be exceeded by every ubatch past ~n_batch.
+        static const bool dsv4_reserve_full2 = getenv("DSV4_RESERVE_FULL") != nullptr;
+        const llama_pos pos0_last = (dsv4_reserve_full2 && model.arch == LLM_ARCH_DEEPSEEK4 && n_tokens > 1 && cparams.n_ctx > n_tokens)
+            ? (llama_pos) (cparams.n_ctx - n_tokens) : 0;
+        auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(), model.hparams.no_alloc, nullptr, pos0_last);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
@@ -653,6 +664,12 @@ void llama_context::sched_reserve() {
 }
 
 void llama_context::synchronize() {
+    {
+        static int synclog_ctx_n = 0;
+        if (getenv("GGML_SYNCLOG") != NULL) {
+        LLAMA_LOG_INFO("[SYNCLOG] ctxsync #%d t=%.3f\n", ++synclog_ctx_n, ggml_time_us()/1e6);
+        }
+    }
     if (!sched) {
         return;
     }

@@ -867,9 +867,19 @@ static ggml_tensor * dsv4_new_filled_3d(ggml_context * ctx, int64_t n0, int64_t 
 // padded tail carries zero attention weight - bit-identical output.
 static void dsv4_pad_fattn_width(ggml_context * ctx, ggml_tensor ** k_all, ggml_tensor ** attn_mask) {
     const int64_t w   = (*k_all)->ne[2];
-    const int64_t pad = ((w + 255) / 256) * 256 - w;
+    int64_t       pad = ((w + 255) / 256) * 256 - w;
     if (pad == 0) {
-        return;
+        // DSV4_STABLE_TOPO=1: emit the pad pair even at an aligned width (one
+        // full 256 tile under a -INF mask, same proven semantics). Otherwise
+        // these two nodes appear and disappear per ubatch, consecutive prefill
+        // graphs alternate topology, and ggml_backend_sched pays a full
+        // realloc + all-GPU drain on every ubatch (70 per 32K prefill), which
+        // keeps the ubatch pipeline from ever engaging.
+        static const bool stable_topo = getenv("DSV4_STABLE_TOPO") != nullptr;
+        if (!stable_topo) {
+            return;
+        }
+        pad = 256;
     }
     // NB: CUDA ggml_pad asserts F32, so pad K via an F16 zero-fill + concat
     // (fill.cu supports F16).
