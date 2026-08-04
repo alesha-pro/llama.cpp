@@ -3366,13 +3366,19 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 }
 
 #ifdef USE_CUDA_GRAPH
-static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph, bool * dsv4_prefill_batch) {
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+
+        // a routed-expert matmul over >=64 tokens marks this as a prefill
+        // ubatch graph (decode graphs carry 1-2 tokens)
+        if (dsv4_prefill_batch && node->op == GGML_OP_MUL_MAT_ID && node->ne[2] >= 64) {
+            *dsv4_prefill_batch = true;
+        }
 
         if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
             continue;
@@ -3559,19 +3565,19 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
     cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &errorNode, &result_info);
 #endif // CUDART_VERSION >= 12000
 
-    if (stat == cudaErrorGraphExecUpdateFailure) {
+    if (stat != cudaSuccess) {
 #ifndef NDEBUG
-        GGML_LOG_DEBUG("%s: CUDA graph update failed\n", __func__);
+        GGML_LOG_DEBUG("%s: CUDA graph update failed (%s)\n", __func__, cudaGetErrorString(stat));
 #endif
 
-        // The pre-existing graph exec cannot be updated due to violated constraints
-        // so instead clear error and re-instantiate
+        // The pre-existing graph exec cannot be updated (violated constraints,
+        // changed kernel functions across width thresholds, ...) - clear the
+        // error and re-instantiate. With DSV4_PREFILL_GRAPHS this can happen
+        // on any ubatch, so every update failure must stay recoverable.
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
         CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
-    } else {
-        GGML_ASSERT(stat == cudaSuccess);
     }
 }
 #endif // USE_CUDA_GRAPH
@@ -4459,7 +4465,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, bool use_cuda_graph, bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -4644,13 +4650,34 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 graph->graph = nullptr;
             }
 
-            CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
-            graph_evaluated_or_captured = true; // CUDA graph has been captured
+            const cudaError_t capture_stat = cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph);
 
-            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
-            if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
-                ggml_cuda_lock_cv.notify_all();
+            {
+                std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+                if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                    ggml_cuda_lock_cv.notify_all();
+                }
             }
+
+            if (capture_stat != cudaSuccess) {
+                // The capture was invalidated (an op used a capture-illegal
+                // API that survived to EndCapture, e.g. an unjoined side
+                // stream). None of the captured work has run - clear the
+                // error, retire this key from capture, and re-execute the
+                // graph directly. Note: a capture-illegal call that errors
+                // mid-evaluation still aborts in that op's CUDA_CHECK; this
+                // handles the failures that only surface at EndCapture.
+                (void) cudaGetLastError();
+                GGML_LOG_WARN("%s: CUDA graph capture failed (%s) - direct execution for key=%p from now on\n",
+                    __func__, cudaGetErrorString(capture_stat), graph_key);
+                graph->graph = nullptr;
+                graph->dsv4_capture_broken = true;
+                use_cuda_graph = false;
+                cuda_graph_update_required = false;
+                continue; // re-run the node loop without capture
+            }
+
+            graph_evaluated_or_captured = true; // CUDA graph has been captured
         } else {
             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
         }
@@ -4706,8 +4733,37 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
-        if (graph_compatible) {
+        bool dsv4_prefill_batch = false;
+        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph, &dsv4_prefill_batch);
+        static const bool dsv4_prefill_graphs = getenv("DSV4_PREFILL_GRAPHS") != nullptr;
+        if (graph_compatible && dsv4_prefill_graphs && dsv4_prefill_batch) {
+            // DSV4_PREFILL_GRAPHS capture-always: prefill ubatch properties can
+            // never stabilize (input-slot rotation, ARANGE op_params, growing
+            // [n_comp] shapes - DS4HANDOFF section 8), so skip the stability
+            // gate and capture every call. The win is the capture itself:
+            // launches are recorded host-side instead of entering the
+            // contended command channels, then one cudaGraphLaunch submits the
+            // whole split. Each capture is used exactly once, immediately;
+            // the props walk is skipped as pure overhead.
+            //
+            // Captures live under a shadow key (key+1): prefill and decode
+            // share nodes[0] on this rig, and overwriting the decode entry's
+            // instance here would make a later warm decode token replay the
+            // prefill graph (silent corruption).
+            graph_key = (const void *) ((const char *) graph_key + 1);
+            graph = cuda_ctx->cuda_graph(graph_key);
+            if (!graph->dsv4_capture_broken) {
+                use_cuda_graph = true;
+                cuda_graph_update_required = true;
+                if (getenv("DSV4_GRAPH_DBG")) {
+                    static std::atomic<int> n_captures{0};
+                    const int c = n_captures.fetch_add(1, std::memory_order_relaxed);
+                    if (c < 2 || c % 256 == 0) {
+                        GGML_LOG_INFO("DSV4GDBG: capture-always #%d key=%p n=%d\n", c, graph_key, cgraph->n_nodes);
+                    }
+                }
+            }
+        } else if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (!graph->warmup_complete) {
