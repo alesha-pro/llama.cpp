@@ -288,6 +288,40 @@ Diagnostics used are still in the tree behind `GGML_SYNCLOG=1`: `[SYNCLOG]`
 counters for realloc / sched-sync / ctx-sync and `[GALLOCFAIL]` lines naming the
 first node whose planned size was exceeded.
 
+## 0e. 2026-08-04 late: capture-always CUDA graphs — prefill 513 -> 1162 t/s @32K
+
+The plan-item from section 8 landed the same evening as its recon (commit
+`ed7794b`, design "B2"). `DSV4_PREFILL_GRAPHS=1` skips the graph-stability
+gate for prefill-sized splits (MUL_MAT_ID with ne2 >= 64) and captures every
+ubatch: launches are recorded host-side — never entering the contended
+command channels that cost 151 us per launch — then one `cudaGraphLaunch`
+submits the whole ~2200-node split. Captures live under a shadow key (key+1)
+because prefill and decode share `nodes[0]` and a shared entry would make a
+warm decode token silently replay a prefill graph. EndCapture failures retire
+the key to direct execution; ExecUpdate failures re-instantiate. The flag is
+in the ship set (`ds4m-serve.sh`); kill switch `GGML_CUDA_DISABLE_GRAPHS=1`.
+
+Same-day ladder vs the srso-off baseline (0731 UD-IQ2_M, ship flags,
+batch 8192, warm medians):
+
+| depth | prefill before | prefill after | decode |
+|---:|---:|---:|---:|
+| 32K | 513.5 | **1162** (+126%) | 38.0 (flat) |
+| 98K | 442* | **509** (+15%) | 37.0 |
+| 130K | 404* | **444** (+10%) | 36.1 |
+
+(*98K/130K "before" are the morning mitigations-on numbers — no same-day
+srso-off non-B2 arm exists at depth; the srso delta at 32K was +1.9%.)
+
+GPU busy during 32K prefill rose from 27-30% to **66-83% active-window mean**
+(peaks 100%). Sanity: 17*23=391 through 3.7K- and 13.7K-token prefills,
+coherent long output. Decode is untouched by design (old path, own keys).
+
+Why the win shrinks with depth: GPU compute grows with attention width, so
+submission overhead — the thing B2 removes — is a smaller share; and under
+capture the union-FA path self-disables (its 4-byte readback+sync), which
+costs the most exactly at depth. Follow-ups in section 8 / open experiments.
+
 ## 1. The engine (fork)
 
 - On the rig: `/mnt/ssd/engines/llama.cpp-v4-cchuter`, branch **`ds4-longctx`**.
@@ -444,6 +478,16 @@ no MTP, after one plan-warming request:
 131K:  404 t/s prefill,     37.8 t/s decode
 GPU utilisation during prefill: 27-30% per card - host-bound on kernel submission
 ```
+
+Same day, after srso/retbleed off (+1.9% @32K) and capture-always CUDA graphs
+(section 0e):
+
+```
+32K:   1162 t/s prefill, 38.0 decode     (was 513.5 same-day baseline)
+98K:    509 t/s prefill, 37.0 decode
+130K:   444 t/s prefill, 36.1 decode
+GPU utilisation during prefill: 66-83% active-window mean, peaks 100%
+```
 Historic headline: CPU-fallback fix took prefill 31.6 → 531 t/s (a 23.5K prompt
 from 25 min to 53 sec). This is the "×29" hook of the X thread.
 
@@ -473,13 +517,13 @@ kernel submission** (section 0d), so kernel-level work cannot move it. The GPUs
 are 27-30% busy and the host thread spends its cycles yield-spinning inside
 cudaLaunchKernel. Ranked by expected value:
 
-- **CUDA graphs for prefill ubatches** — the one structural fix. One
-  `cudaGraphLaunch` per split instead of ~1500 individual launches; decode
-  already does this. Shapes must be bucketed the way `DSV4_CS_BUCKET` buckets
-  the decode masks (pad masks/views to a multiple, re-capture once per bucket,
-  replay in between). Instantiate is cheap — 337 us on an 8K-node decode graph.
-  Ceiling implied by summed GPU busy time: about **3x the current 520 t/s**,
-  i.e. the 700-800 t/s target.
+- **CUDA graphs for prefill ubatches — DONE 2026-08-04 (section 0e).** Landed
+  as capture-always (design B2), not bucketed replay (B1): +126% @32K to
+  1162 t/s, +15% @98K, +10% @130K. B1 (stability program: sanitized props,
+  slot keys, ARANGE-as-data, SET_ROWS cache writes, CS_BUCKET-style width
+  bucketing) remains the phase-2 option if profiling still shows host-bound
+  sections at depth — but the next depth wins more likely come from the
+  follow-ups below.
 - **`spec_rstack_overflow=off` — DONE 2026-08-04, kept.** Rebooted with
   `spec_rstack_overflow=off retbleed=off` (EPYC 7642 is Zen 2, so the retbleed
   return thunk had to go too; STIBP also relaxed always-on → conditional).
@@ -565,6 +609,18 @@ Two viable designs, in build order:
 
 ### Open experiments (cheap, not yet run)
 
+- **Capture-safe union-FA** — under capture the union path self-disables (its
+  max_union overflow check is a 4-byte D2H + sync, fattn.cu). Launching the
+  build kernel at the host-known cap and resolving overflow on-device (or
+  accepting cap as the grid and masking) would recover the union win inside
+  captured prefills — worth the most at 98K+ where the gap to the old numbers
+  is smallest.
+- **Depth-decode control arm** — 98K/130K decode reads 37.0/36.1 under B2 vs
+  38.3/37.8 in the morning table, but no same-day non-B2 srso-off arm exists
+  at depth; one `DSV4_PREFILL_GRAPHS=0` server start at 98K settles whether
+  that is noise, the srso/retbleed flags, or a real B2 interaction.
+- **`-ts` rebalancing and the 220 W power limit** — previously pointless at
+  27-30% GPU busy; with prefill now 66-83% busy these are live levers again.
 - **Expert parallel together with the 2026-08-04 fixes** — never measured in
   combination. EP alone is +22% prefill / -32% decode; the fixes lift both. If
   the decode penalty stays proportional this is still a prefill-only mode, but
