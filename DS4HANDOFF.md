@@ -497,11 +497,18 @@ Same day, after srso/retbleed off (+1.9% @32K) and capture-always CUDA graphs
 (section 0e):
 
 ```
+At the long-standing 220 W power limit:
 32K:   1484 t/s prefill, 38.0 decode    (513.5 same-day no-B2 control)
 98K:   1460 t/s prefill, 37.0 decode    (435.9 same-day no-B2 control)
 130K:  1381 t/s prefill, 36.9 decode
 GPU utilisation during warm prefill: 93-96%, power-capped at 220 W 94% of time
-Cold first request per depth still climbs at ~old speeds (390 @130K) - see 0e
+
+After nvidia-smi -pl 350 (same session, warm 130K, power curve):
+220 W: 1381   280 W: 1679   300 W: 1742   350 W: 1807-1823
+32K @350 W: 1862 t/s. Decode power-insensitive (36.6-37.9 across limits).
+Real draw at -pl 350: 307-331 W mean, temps max 83 C in a 3-min burst.
+Cold first request per depth still climbs slowly (390 @220 W, 510 @350 W)
+Power limit is NOT persistent across reboots (something sets 220 at boot).
 ```
 Historic headline: CPU-fallback fix took prefill 31.6 → 531 t/s (a 23.5K prompt
 from 25 min to 53 sec). This is the "×29" hook of the X thread.
@@ -624,10 +631,12 @@ Two viable designs, in build order:
 
 ### Open experiments (cheap, not yet run)
 
-- **Raise the 220 W power limit** — now the #1 lever: warm B2 prefill pins
-  all four cards at the cap 94% of the time (means 211-216 W). The 3090 is a
-  350 W part; even 260-280 W should move depth prefill directly. Needs
-  `nvidia-smi -pl` (root) and a thermal sanity watch.
+- **Raise the 220 W power limit — DONE, curve measured** (warm 130K):
+  220 W 1381 / 280 W 1679 / 300 W 1742 / 350 W 1823 t/s. 280 W captures
+  two-thirds of the full-watts gain; 350 W ran at 83 C max in a 3-minute
+  burst (GDDR6X junction temp not exposed by this driver — watch it if 350 W
+  becomes the sustained default). Limit resets at boot; persistence needs
+  whatever service currently sets 220 to be updated.
 - **Auto-warm the sticky plan + pool at startup** — promoted by 0e: the first
   request per depth runs ~3.5x slower than warm (390 vs 1381 @130K). One
   synthetic full-depth pass during server start hides the climb from every
