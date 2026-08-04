@@ -485,13 +485,75 @@ cudaLaunchKernel. Ranked by expected value:
 - `-ts` rebalancing and raising the 220 W power limit are **not** useful yet:
   at 27-30% utilisation the cards are not the constraint (they draw ~175 W of
   220 under load). Revisit both once the launch path is fixed.
+- **Multi-threaded submission** — the alternative (or complement) to graphs, if
+  capture turns out to be blocked by DSV4's dynamic shapes. Today one host
+  thread submits for all four devices in sequence at 99% CPU; a submitter thread
+  per device would overlap the yield-spin instead of serialising it.
+  `ggml_backend_sched` is single-threaded here, so this is the more invasive of
+  the two — try graphs first.
+- **The last 4 CPU splits**: `GET_ROWS` over `token_embd.weight` (347 MB, kept
+  on the CPU) still runs on the CPU backend once per graph. Tiny next to what
+  was fixed, but it is now the only remaining backend boundary.
+- **Auto-warm the sticky plan at startup** — the one blemish of
+  `GGML_GALLOC_STICKY` is that the first request at a new depth after a server
+  start still pays the climb. A synthetic warm pass at `n_ctx` during
+  `sched_reserve` would hide it; needs care not to inflate the reserve buffers.
 - Older ideas, still valid but smaller: fused-kernel dual accumulation in
   mmq.cuh (est +4-8%), and requanting down to IQ2_XXS (+5-7%, quality-sensitive,
   needs a perplexity gate — and note this model's down is already IQ3_XXS).
 - External reviews were run via /codex + /opencode (deepseek-v4-pro, kimi, glm)
   through the rig's opencode. codex + glm were most useful on the MTP debug.
 
+### Open experiments (cheap, not yet run)
+
+- **Expert parallel together with the 2026-08-04 fixes** — never measured in
+  combination. EP alone is +22% prefill / -32% decode; the fixes lift both. If
+  the decode penalty stays proportional this is still a prefill-only mode, but
+  the arithmetic changes and it is one server start to find out.
+- **Maximum context on this checkpoint** — the old 163840 ceiling was measured
+  *with* MTP weights resident on CUDA3. UD-IQ2_M has no MTP head, which frees
+  roughly 5 GB, so the ceiling should be higher. Untested.
+- **`DSV4_MOE_RESIDENT_TILE=32`** measured +2.4% at 32K, inside the ~3%
+  between-restart noise. Needs 3+ repeats per arm to call; tile 8 is clearly bad
+  (-13.1%), so the curve is worth one careful sweep.
+- **Depth beyond 131K on the ship config** — 32K/98K/131K are covered, 163K+ is
+  not.
+
+### Parked by decision (recon done, so it is cheap to restart)
+
+**MTP head for 0731.** Alexey's call was to skip it this session, but the
+groundwork is done and worth not re-deriving: the MTP tensors live in shards
+46-48 of `deepseek-ai/DeepSeek-V4-Flash-0731` (4705 tensors, ~10.9 GB, so a
+partial download is enough), `convert_hf_to_gguf.py` in this fork already knows
+`model.mtp_block.N` / `mtp_emb_norm` / `skip_mtp`, and the runtime loader
+(`dsv4_mtp_get` in `src/models/deepseek4.cpp`) accepts *any* GGUF whose tensors
+are named `mtp.0.*` — it just reads them onto `DSV4_MTP_DEV`. The work is the
+name mapping (HF `mtp.0.attn.wq_a.weight` + `.scale` → the fork's flat names),
+the FP8 scale handling, and merging 256 per-expert tensors. On the previous
+checkpoint MTP was worth +31% short / +20% deep decode.
+
 ## 9. All documentation and content (verified locations)
+
+**Measurement harness (2026-08-04, on the rig at `~/ds4-sweep/`)** — reuse it
+rather than rebuilding one:
+
+- `ab2.sh` — one A/B arm: kills the previous server by PID, waits for real
+  readiness, sweeps, verifies the flag actually engaged, tears down. `SWEEP=0`
+  leaves the server up for interactive work.
+- `ds4m-serve.sh` — the UD-IQ2_M launch script; every flag overridable from the
+  environment, ship defaults already set.
+- `ds4bench2.py` + `prompts/p{32768,65536,98304,130560}.txt` — depth sweep over
+  pre-cut prompts, so every arm sees byte-identical input and no arm depends on
+  `/tokenize`. `cutprompts.py` regenerates them.
+- `overlap.py` — per-GPU busy, ANY-BUSY, ALL-IDLE and the overlap factor from an
+  nsys sqlite; `kerncount.py` — launch counts (the fusion-target list);
+  `diffprof.py` / `diffapi.py` — differential kernel and API profiles between
+  two traces; `timeline.py` — chronology of one step.
+- `summary.py` — collects every arm in `results/` into one delta table.
+- `req.py` — single request with timings; `sanity.py` — three prompts with
+  checkable answers (17*23=391), the guard against a kernel that passes a shape
+  test but corrupts real generation.
+
 
 - **Memory (source-of-truth chronology): `/Users/kts/.claude/projects/-Users-kts-dev-projects-agents-x/memory/ds4-longctx-push.md`** (40.9 KB, detailed, dated). Companion: `alexey-llm-hardware-setup.md`.
 - **X thread (RU+EN, the post): `post-queue-ds4-thread.md`** in this repo (agents/x). v3, humanized, hook "×29", 13 tweets + 2 chart placeholders. Posted: https://x.com/superalesha/status/2074569147279724715
