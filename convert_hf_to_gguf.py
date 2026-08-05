@@ -854,6 +854,12 @@ class ModelBase:
                             gguf.MODEL_TENSOR.SSM_CONV1D_V,
                             # DSA indexer weights should be F32
                             gguf.MODEL_TENSOR.INDEXER_PROJ,
+                            # DeepSeek V4 compressor positional embeddings are
+                            # consumed by an op that rejects quantized inputs on
+                            # CUDA - keep them F32 or they land on the CPU and
+                            # shatter the compute graph into per-layer splits
+                            gguf.MODEL_TENSOR.ATTN_COMPRESSOR_APE,
+                            gguf.MODEL_TENSOR.INDEXER_COMPRESSOR_APE,
                         )
                     )
                     or new_name[-7:] not in (".weight", ".lora_a", ".lora_b")
@@ -9617,6 +9623,8 @@ class DeepseekV4Model(TextModel):
     _qtype_aliases: dict[str, gguf.GGMLQuantizationType] = {
         "q8_0": gguf.GGMLQuantizationType.Q8_0,
         "q2_k": gguf.GGMLQuantizationType.Q2_K,
+        "q3_k": gguf.GGMLQuantizationType.Q3_K,
+        "q4_k": gguf.GGMLQuantizationType.Q4_K,
         "iq2_xxs": gguf.GGMLQuantizationType.IQ2_XXS,
         "iq2_xs": gguf.GGMLQuantizationType.IQ2_XS,
         "tq1_0": gguf.GGMLQuantizationType.TQ1_0,
@@ -9884,6 +9892,8 @@ class DeepseekV4Model(TextModel):
     def _quantize_deepseek4_expert(cls, data: np.ndarray, qtype: gguf.GGMLQuantizationType) -> np.ndarray:
         c_quantized_types = {
             gguf.GGMLQuantizationType.Q2_K,
+            gguf.GGMLQuantizationType.Q3_K,
+            gguf.GGMLQuantizationType.Q4_K,
             gguf.GGMLQuantizationType.IQ2_XXS,
             gguf.GGMLQuantizationType.IQ2_XS,
         }
@@ -9935,7 +9945,8 @@ class DeepseekV4Model(TextModel):
             if any(re.match(r"(?:model\.)?layers\.\d+\.ffn\.experts\.\d+\.w[123]\.weight$", name) for name in self.model_tensors):
                 raise NotImplementedError(
                     "DeepSeek V4 routed FP4 experts must be converted directly to a compact GGUF type. "
-                    "Use --outtype iq2_xxs, iq2_xs, q2_k, tq2_0, tq1_0, or q8_0."
+                    "Use --outtype iq2_xxs, iq2_xs, q2_k, tq2_0, tq1_0, or q8_0, "
+                    "or --deepseek4-expert-outtypes (e.g. 'w1=q3_k,w2=q4_k,w3=q3_k')."
                 )
             return set()
 
@@ -14699,7 +14710,7 @@ class LazyTorchTensor(gguf.LazyBase):
         "BOOL": torch.bool,
         "F8_E4M3": torch.float8_e4m3fn,
         "F8_E5M2": torch.float8_e5m2,
-        **({"F8_E8M0": TORCH_FLOAT8_E8M0FNU, "F8_E8M0FNU": TORCH_FLOAT8_E8M0FNU} if TORCH_FLOAT8_E8M0FNU is not None else {}),
+        **({"F8_E8M0": TORCH_FLOAT8_E8M0FNU or torch.uint8, "F8_E8M0FNU": TORCH_FLOAT8_E8M0FNU or torch.uint8}),
     }
 
     def numpy(self) -> gguf.LazyNumpyTensor:
