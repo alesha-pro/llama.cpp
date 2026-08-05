@@ -387,6 +387,67 @@ The 44K incremental response matched a fresh full recompute byte-for-byte
 Authoritative log/result files are `agent-aligned-host-u384.log` and
 `agent-aligned-host-u384-turns6.json` under `~/ds4-sweep/results/`.
 
+## 0f. 2026-08-05: REAP K160 193B — self-converted Q3K/Q4K GGUF, quality parity with UD-IQ2_M
+
+`0xSero/DeepSeek-V4-Flash-0731-REAP` (K160: 160 of 256 experts kept, ~193B
+params, MXFP4 weights, 107.8 GB) was downloaded to
+`/mnt/ssd/models/DeepSeek-V4-Flash-0731-REAP` (SHA-256 verified 48/48) and
+converted in-house. Product:
+`/mnt/ssd/models/DeepSeek-V4-Flash-0731-REAP-K160-Q3KQ4K-final.gguf` — 89.9 GB,
+1328 tensors. Recipe: routed experts `w1=q3_k, w2=q4_k, w3=q3_k` (down-proj is
+the sensitive one), dense tensors Q8_0, compressor APE tensors F32, chat
+template embedded from the UD-IQ2_M metadata (REAP repo ships none; the
+13,698-char Unsloth DSML thinking template was injected via
+`gguf-py/gguf/scripts/gguf_new_metadata.py`, also kept at
+`/mnt/ssd/models/ds4-chat-template.jinja`).
+
+Engine support (two commits on `ds4-longctx`): `topk-moe` CUDA `case 160` +
+test, and converter changes — `q3_k`/`q4_k` in `DeepseekV4Model` expert quant
+aliases and the C `ggml_quantize_chunk` path, APE tensors pinned to F32,
+`F8_E8M0 -> uint8` fallback for torch 2.6.
+
+Conversion gotchas, all cost real time:
+
+- The pinned `transformers==5.5.1` in requirements crashes on the deepseek_v4
+  config. Convert with an override requirements file: `transformers==4.57.1`,
+  `numpy~=1.26.4`, `torch~=2.6.0`, `sentencepiece`, `gguf`, `protobuf<5`.
+- Command shape: `LLAMA_CPP_LIBGGML=$PWD/build-v4-cuda/bin/libggml.so uv run
+  --no-project --with-requirements <req> python convert_hf_to_gguf.py <model>
+  --outtype q8_0 --deepseek4-expert-outtypes w1=q3_k,w2=q4_k,w3=q3_k
+  --deepseek4-expert-workers 32 --outfile <out>`.
+- APE trap: the 62 tiny `attn/indexer_compressor_ape.weight` tensors must stay
+  F32. Quantized to Q8_0 they are rejected by CUDA, the loader silently moves
+  them to CPU, and the scheduler shatters the graph into 209 splits instead of
+  5 — prefill collapses to ~550 t/s. Diagnose via `GGML_SCHED_DEBUG` and the
+  `done_getting_tensors ... cannot be used with preferred buffer type` log
+  line. An already-built GGUF can be repaired by rewriting those tensors from
+  the safetensors source.
+
+Measured on the rig, warm, 262K ctx: prefill **1,675 t/s @32K**, 1,766-1,771
+t/s @64-130K, marginal ~1,830-1,850 t/s; decode 34-36 t/s; VRAM ~92/96 GB.
+The full 200+B UD-IQ2_M fits only 128K; K160 is the first config that does
+256K with better-than-2-bit weights.
+
+Quality A/B vs UD-IQ2_M (benchlocal-cli, temp 0, canonical runs, JSONs in
+`/mnt/ssd/engines/benchlocal-cli/results-*.json`): **total 118/150 vs
+117/150 — parity.** medium 67/75 = 67/75, bugfind 14/15 = 14/15, cli-40
+23/40 vs 22/40, hermesagent 14/20 = 14/20. Error profiles differ: K160 wins
+investigation/multi-step scenarios (CLI-16/17/28/30/40, HA-17/19, BF-09 Go
+slice aliasing), UD wins exact-format text tasks (CLI-01/03/11/35, HA-08/13,
+BF-15 data race). Russian output does not work on either — accepted.
+
+Known cost (candidate optimization, not started): with
+`DSV4_AGENT_CKPT_TAIL=1` at 262K every request pays a fixed ~1.7-3 s for the
+single tail checkpoint, which serializes the full memory state — the price
+grows with the populated context, so after the warm fill short requests show
+~390-800 apparent t/s while long prompts still asymptote to ~1,830. Copying
+only the occupied KV range (or checking whether the copy goes via host instead
+of P2P) is the obvious next lever.
+
+Prod launch: `MODEL=/mnt/ssd/models/DeepSeek-V4-Flash-0731-REAP-K160-Q3KQ4K-final.gguf CTX=262144 bash scripts/ds4-prod-serve.sh`
+(the script warms to `n_ctx-512` itself; `EXTRA_ARGS` env hook added for
+one-off flags).
+
 ## 1. The engine (fork)
 
 - On the rig: `/mnt/ssd/engines/llama.cpp-v4-cchuter`, branch **`ds4-longctx`**.

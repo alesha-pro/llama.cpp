@@ -34,6 +34,7 @@ CTX_CHECKPOINTS=${CTX_CHECKPOINTS:-1}
 CHECKPOINT_EVERY_NT=${CHECKPOINT_EVERY_NT:--1}
 LOG=${LOG:-/tmp/ds4-prod-server.log}
 WARM=${WARM:-1}
+EXTRA_ARGS=${EXTRA_ARGS:-}
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 export GGML_CUDA_P2P=${GGML_CUDA_P2P:-1}
@@ -75,7 +76,7 @@ setsid "$BIN" -m "$MODEL" \
     --ctx-size "$CTX" --batch-size "$BATCH" --ubatch-size "$UBATCH" \
     --ctx-checkpoints "$CTX_CHECKPOINTS" --checkpoint-every-n-tokens "$CHECKPOINT_EVERY_NT" \
     -t "$THREADS" --poll 100 --parallel 1 \
-    --host "$HOST" --port "$PORT" --jinja --alias ds4 > "$LOG" 2>&1 &
+    --host "$HOST" --port "$PORT" --jinja --alias ds4 $EXTRA_ARGS > "$LOG" 2>&1 &
 SRV=$!
 
 for _ in $(seq 1 240); do
