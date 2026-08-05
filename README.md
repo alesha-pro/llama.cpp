@@ -82,6 +82,25 @@ See [DS4_OPTIMIZATION_2026-07-27.md](DS4_OPTIMIZATION_2026-07-27.md) for the mec
 
 ### Current checkpoint (0731 UD-IQ2_M) — one command, auto-warmed
 
+This is the recommended interactive/agent server configuration for the
+4x RTX 3090 host. The 0731 UD-IQ2_M checkpoint has no compatible MTP head, so
+do not add the older `DSV4_MTP_*` flags to this launch.
+
+Build after changing the source:
+
+```bash
+cmake --build build-v4-cuda --target llama-server -j 8
+```
+
+The fast prefill measurements use a 350 W power limit. It is not persistent
+across reboots:
+
+```bash
+sudo nvidia-smi -pl 350
+```
+
+Start the server:
+
 ```bash
 MODEL=/path/to/DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
 bash scripts/ds4-prod-serve.sh
@@ -91,15 +110,100 @@ The script starts `llama-server` with the full ship flag set on
 `0.0.0.0:18080`, waits for readiness, then runs one synthetic full-depth
 prefill so the sticky allocator plans and CUDA pools reach their high-water
 marks — after that every request, including the first real one, runs at warm
-speed instead of paying the ~3x allocator climb. `WARM=0` skips the warm
-pass; `MODEL`, `PORT`, `CTX`, `BATCH`, `-ts` and every `DSV4_*` flag are
-overridable from the environment.
+speed instead of paying the ~3x allocator climb. Wait for this line before
+recording a benchmark or opening the server to real traffic:
+
+```text
+=== production server warm and ready on 0.0.0.0:18080 ===
+```
+
+The WebUI is at `http://SERVER_IP:18080/`; the OpenAI-compatible endpoint is
+`http://SERVER_IP:18080/v1/chat/completions`.
+
+#### Verified defaults and what they affect
+
+| setting | production default | effect / guidance |
+|---|---:|---|
+| `CTX` | `131072` | maximum context allocated at startup; larger values increase compressed-KV and graph memory |
+| `BATCH` | `8192` | outer prompt batch; keep this for throughput |
+| `UBATCH` | `384` | GPU microbatch; divisible by the 128-token DS4 compressor ratio and verified without CUDA graph failures |
+| `TS` | `1,1,0.95,1.05` | layer/weight distribution across GPUs; keeps the tight GPU2 safer than an equal split |
+| `CTX_CHECKPOINTS` | `1` | one correctness-safe host checkpoint for agent prefix reuse |
+| `CHECKPOINT_EVERY_NT` | `-1` | disables periodic checkpoints; the aligned tail checkpoint is sufficient and avoids repeated large state copies |
+| `WARM` | `1` | performs the required one-time full-depth allocator/CUDA-pool warm pass; use `0` only for diagnostics |
+| `LOG` | `/tmp/ds4-prod-server.log` | server stdout/stderr; override it for durable benchmark logs |
+| `PORT` | `18080` | WebUI and API port |
+| `NGL` | `999` | offload all possible layers; do not lower for normal production |
+| `FIT_TARGET` | unset | optional auto-fit reserve target; diagnostic only, not part of the verified production layout |
+
+Examples:
+
+```bash
+# Use the rig's standard model path and keep a durable log.
+LOG=$HOME/ds4-sweep/results/prod.log bash scripts/ds4-prod-serve.sh
+
+# Start without the expensive warm pass for a quick diagnostic only.
+WARM=0 PORT=18081 bash scripts/ds4-prod-serve.sh
+
+# Override context deliberately; the warm pass follows CTX.
+CTX=65536 LOG=/tmp/ds4-64k.log bash scripts/ds4-prod-serve.sh
+```
+
+#### Ship flags, briefly
+
+| group | flags | what they do |
+|---|---|---|
+| agent rollback | `DSV4_AGENT_CKPT_TAIL=1` | keeps one checkpoint on a 128-token boundary; without the alignment, incremental prefill falls into the slow per-token compressor path |
+| prefill submission | `DSV4_PREFILL_GRAPHS=1`, `DSV4_STABLE_TOPO=1`, `GGML_GALLOC_STICKY=1` | capture each large prefill graph and prevent per-ubatch allocator replanning/all-GPU drains |
+| prefill attention | `DSV4_SPARSE_FA=1`, `DSV4_FA_UNION=1`, `DSV4_IDX_SKIP=1`, `DSV4_PREFILL_RADIX_TOPK=1` | sparse compressed attention and bounded Top-K memory; radix Top-K is required beyond about 90K |
+| MoE prefill | `DSV4_MOE_TILE=1`, `DSV4_MOE_RESIDENT=1`, `DSV4_GLU_FUSE=1`, `DSV4_MOE_FUSE=1` | remove dead MMQ work and host synchronization, then fuse routed-expert work |
+| decode | `DSV4_CONSTANT_SHAPE=1`, `DSV4_DECODE_FUSED_IDX=1`, `DSV4_DECODE_RADIX_TOPK=1`, `DSV4_MMVQ_SMALLK=1` | stable decode graph plus faster Lightning Indexer and exact Top-512 selection |
+| multi-GPU | `GGML_CUDA_P2P=1` | enables peer copies between the four cards |
+
+All flags remain individually overridable. Useful kill switches are
+`DSV4_PREFILL_GRAPHS=0` for prefill capture and
+`GGML_CUDA_DISABLE_GRAPHS=1` for all CUDA graphs. They are diagnostic controls,
+not recommended production settings.
+
+#### Agent behavior and expected speed
+
+Do not pass `--ctx-checkpoints 0`: this SWA/recurrent model then has to
+re-prefill the whole transcript after a generated tail diverges from the next
+request. The production launcher instead keeps one full host checkpoint and
+rounds its replay position down to a 128-token boundary. This preserves the
+batched compressor and, unlike the rejected recurrent-only device snapshot,
+matches a fresh full recompute byte-for-byte.
+
+With a 31K seed and roughly 10K-token additions, the verified six-turn run
+measured 1,475 / 1,543 / 1,483 / 1,292 / 1,354 / 1,242 prompt tokens/s through
+approximately 95K context, with 38.6-39.7 decode tokens/s. The first addition
+was 296 tokens/s before checkpoint alignment. See
+[DS4HANDOFF.md](DS4HANDOFF.md) for the full table and correctness hash.
+
+#### Logs and basic operations
+
+```bash
+# Health and current listener.
+curl -s http://127.0.0.1:18080/health
+lsof -nP -iTCP:18080 -sTCP:LISTEN
+
+# Follow the default log.
+tail -f /tmp/ds4-prod-server.log
+
+# Stop only the exact PID shown by lsof; never use pkill -f on the rig.
+kill SERVER_PID
+```
+
+If prefill is unexpectedly slow, first verify that the startup warm pass
+finished, the power limit is still 350 W, no other process is using the GPUs,
+and the launch log shows `ubatch=384`, one context checkpoint, and the ship
+flags. A cold first request or an unaligned agent checkpoint can both look like
+a kernel regression while the kernels themselves are fine.
 
 Two operational rules learned the hard way:
 
-- do **not** pass `--ctx-checkpoints 0` when serving agents — default context
-  checkpoints are what let a transcript rollback reuse the prefix cache
-  instead of re-prefilling the whole context on this SWA model;
+- do **not** disable the launcher's aligned context checkpoint when serving
+  agents;
 - the power limit is worth raising (`sudo nvidia-smi -pl 350`, resets at
   boot): warm prefill is power-bound, and 220 → 350 W is +31% prefill with
   the cards peaking at 83 C in bursts.

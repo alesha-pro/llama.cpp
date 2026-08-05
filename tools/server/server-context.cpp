@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -45,6 +46,20 @@ extern "C" bool dsv4_mtp_state_shadow(llama_memory_t mem, int32_t n_layer, int32
 // advances there - a reject then needs the shadow restore, not just seq_rm)
 static bool dsv4_closes_chunk(llama_pos p) {
     return ((p + 1) % 4) == 0 || ((p + 1) % 128) == 0;
+}
+
+static int64_t dsv4_agent_ckpt_target(int64_t n_tokens, int32_t n_swa) {
+    GGML_ASSERT(n_swa > 0);
+
+    const int64_t target = n_tokens - (4 + n_swa);
+    if (target <= 0) {
+        return target;
+    }
+
+    // DS4 uses compression ratios 4 and 128, while n_swa is 128. Starting
+    // replay at an unaligned position disables the batched compressor for
+    // every following ubatch and falls back to the much slower per-token graph.
+    return target - target % n_swa;
 }
 
 constexpr int HTTP_POLLING_SECONDS = 1;
@@ -2711,6 +2726,11 @@ private:
 
                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
 
+                    static const bool dsv4_agent_ckpt_tail = [] {
+                        const char * value = std::getenv("DSV4_AGENT_CKPT_TAIL");
+                        return value != nullptr && value[0] != '\0' && value[0] != '0';
+                    }();
+
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
 
@@ -2800,7 +2820,16 @@ private:
                                 return slot.task->n_tokens() == slot.prompt.n_tokens() + n_last;
                             };
 
-                            if (should_checkpoint_tail(4 + n_ubatch)) {
+                            // DeepSeek-V4 agent sessions normally grow monotonically. For that
+                            // traffic the only tail checkpoint that can be restored on the next
+                            // turn is the one immediately outside the SWA window. Avoid taking
+                            // four additional full-state snapshots, which become very expensive
+                            // at long context. Keep the generic rollback ladder as the default.
+                            if (dsv4_agent_ckpt_tail && n_swa > 0) {
+                                const int64_t n_target = dsv4_agent_ckpt_target(slot.task->n_tokens(), n_swa);
+                                const int64_t n_last   = slot.task->n_tokens() - n_target;
+                                should_break = n_target > 0 && n_last <= n_batch && should_checkpoint_tail(n_last);
+                            } else if (should_checkpoint_tail(4 + n_ubatch)) {
                                 should_break = true;
                             } else if (n_swa > 0 && n_swa < n_ubatch) {
                                 for (int offset = 4 + ((n_ubatch / n_swa) * n_swa); offset > 4; offset -= n_swa) {
@@ -2874,6 +2903,19 @@ private:
 
                     // no need to create checkpoints that are too close together
                     do_checkpoint = do_checkpoint && (slot.prompt.checkpoints.empty() || slot.prompt.n_tokens() - n_tokens_cur > slot.prompt.checkpoints.back().n_tokens + 64);
+
+                    // The agent fast path keeps exactly the checkpoint that the
+                    // next monotonically growing request can restore: the state
+                    // immediately before the final SWA window and logits tail.
+                    // The earlier near-tail and final-logits snapshots are never
+                    // selected for that traffic, but each serializes the full
+                    // recurrent state.
+                    if (dsv4_agent_ckpt_tail && n_swa > 0) {
+                        const int64_t n_checkpoint = slot.prompt.n_tokens() - n_tokens_cur;
+                        const int64_t n_target     = dsv4_agent_ckpt_target(slot.task->n_tokens(), n_swa);
+                        do_checkpoint = do_checkpoint && n_checkpoint == n_target;
+                    }
+
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not

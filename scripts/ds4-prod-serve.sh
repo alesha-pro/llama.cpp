@@ -12,8 +12,7 @@
 # Details: DS4HANDOFF.md section 0e.
 #
 # Notes:
-# - context checkpoints stay at their default (NO --ctx-checkpoints 0):
-#   agent traffic needs them for rollback prefix-reuse on this SWA model;
+# - one aligned checkpoint keeps agent rollback prefix reuse fast;
 # - every DSV4_* flag below is overridable from the environment;
 # - kill switches: DSV4_PREFILL_GRAPHS=0 (prefill CUDA graphs),
 #   GGML_CUDA_DISABLE_GRAPHS=1 (all CUDA graphs).
@@ -25,10 +24,14 @@ BIN=${BIN:-build-v4-cuda/bin/llama-server}
 HOST=${HOST:-0.0.0.0}
 PORT=${PORT:-18080}
 CTX=${CTX:-131072}
-TS=${TS:-1,1,1,1}
-UBATCH=${UBATCH:-512}
+TS=${TS:-1,1,0.95,1.05}
+NGL=${NGL:-999}
+FIT_TARGET=${FIT_TARGET:-}
+UBATCH=${UBATCH:-384}
 BATCH=${BATCH:-8192}
 THREADS=${THREADS:-8}
+CTX_CHECKPOINTS=${CTX_CHECKPOINTS:-1}
+CHECKPOINT_EVERY_NT=${CHECKPOINT_EVERY_NT:--1}
 LOG=${LOG:-/tmp/ds4-prod-server.log}
 WARM=${WARM:-1}
 
@@ -51,6 +54,7 @@ export DSV4_MMVQ_SMALLK=${DSV4_MMVQ_SMALLK:-1}
 export DSV4_STABLE_TOPO=${DSV4_STABLE_TOPO:-1}
 export GGML_GALLOC_STICKY=${GGML_GALLOC_STICKY:-1}
 export DSV4_PREFILL_GRAPHS=${DSV4_PREFILL_GRAPHS:-1}
+export DSV4_AGENT_CKPT_TAIL=${DSV4_AGENT_CKPT_TAIL:-1}
 
 if lsof -ti :"$PORT" >/dev/null 2>&1; then
     echo "!! port $PORT already in use; stop the old server first: kill \$(lsof -ti :$PORT)" >&2
@@ -58,10 +62,19 @@ if lsof -ti :"$PORT" >/dev/null 2>&1; then
 fi
 
 echo "=== starting llama-server on $HOST:$PORT (log: $LOG) ==="
+load_args=(-ngl "$NGL")
+if [ "$TS" != "auto" ]; then
+    load_args+=(-ts "$TS")
+fi
+if [ -n "$FIT_TARGET" ]; then
+    load_args+=(--fit-target "$FIT_TARGET")
+fi
+
 setsid "$BIN" -m "$MODEL" \
-    -ngl 999 --split-mode layer --flash-attn on --no-repack \
+    "${load_args[@]}" --split-mode layer --flash-attn on --no-repack \
     --ctx-size "$CTX" --batch-size "$BATCH" --ubatch-size "$UBATCH" \
-    -t "$THREADS" --poll 100 -ts "$TS" --parallel 1 \
+    --ctx-checkpoints "$CTX_CHECKPOINTS" --checkpoint-every-n-tokens "$CHECKPOINT_EVERY_NT" \
+    -t "$THREADS" --poll 100 --parallel 1 \
     --host "$HOST" --port "$PORT" --jinja --alias ds4 > "$LOG" 2>&1 &
 SRV=$!
 

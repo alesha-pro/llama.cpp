@@ -354,6 +354,39 @@ Ship note: `--ctx-checkpoints 0` was a bench-purity flag; do NOT pass it when
 serving agents — without checkpoints any transcript rollback on this SWA
 model degrades to a full re-prefill.
 
+### Agent incremental-prefill alignment fix (2026-08-04, production-safe)
+
+The remaining agent regression was not checkpoint I/O or long-context compute.
+The single tail checkpoint originally restored a 31,438-token seed at position
+**31,306**, which is not divisible by DS4's 128-token compression ratio. Every
+following `ubatch=384` therefore failed `chunk_aligned` and used the enormous
+per-token compressor graph. The same 42,735-token context took **1,779 t/s**
+when processed from position 0 but only **296 t/s** as an 11,429-token append.
+
+`DSV4_AGENT_CKPT_TAIL=1` now rounds the one useful tail checkpoint backwards
+to an `n_swa` boundary (31,232 in that case). At most 127 extra tokens are
+replayed, but all full ubatches stay on the batched compressor. Production uses
+one checkpoint and disables periodic checkpoints; the full host checkpoint is
+intentional. An attempted recurrent/SWA-only on-device checkpoint reached about
+1,525 t/s but produced a different greedy answer and was removed.
+
+Correctness-safe `ubatch=384`, `-ts 1,1,0.95,1.05` results from
+`scripts/ds4-agentic-roundtrip.py`, after the full-depth startup warm pass:
+
+| turn | approximate context | incremental prefill | wall | decode |
+|---:|---:|---:|---:|---:|
+| 1 | 44K | **1,475 t/s** | 8.2 s | 39.68 t/s |
+| 2 | 54K | **1,543 t/s** | 10.1 s | 38.75 t/s |
+| 3 | 64K | **1,483 t/s** | 10.8 s | 38.62 t/s |
+| 4 | 75K | **1,292 t/s** | 7.0 s | 38.95 t/s |
+| 5 | 85K | **1,354 t/s** | 9.0 s | 38.74 t/s |
+| 6 | 95K | **1,242 t/s** | 8.7 s | 38.85 t/s |
+
+The 44K incremental response matched a fresh full recompute byte-for-byte
+(SHA-256 `027f97cf93e22d0225d0cfe67cb5b9042c418671c1a808818ad87e17337421d6`).
+Authoritative log/result files are `agent-aligned-host-u384.log` and
+`agent-aligned-host-u384-turns6.json` under `~/ds4-sweep/results/`.
+
 ## 1. The engine (fork)
 
 - On the rig: `/mnt/ssd/engines/llama.cpp-v4-cchuter`, branch **`ds4-longctx`**.
@@ -419,9 +452,11 @@ BMC if hung (address/credentials in the private access note): `ipmitool -C 17 ch
 
 **Current (2026-08-04, 0731 UD-IQ2_M): `bash scripts/ds4-prod-serve.sh`** —
 in-repo, self-contained: full ship flag set (incl. capture-always graphs),
-binds 0.0.0.0:18080, default context checkpoints (agent prefix-reuse), and an
-automatic synthetic full-depth warm pass so the first real request runs at
-warm speed. `WARM=0` skips warming; everything overridable from env. The
+binds 0.0.0.0:18080, uses one aligned host checkpoint for agent prefix-reuse
+(`DSV4_AGENT_CKPT_TAIL=1`, periodic checkpoints off), and runs an automatic
+synthetic full-depth warm pass so the first real request is warm. Defaults are
+`--ubatch-size 384` and `-ts 1,1,0.95,1.05`; `WARM=0` skips warming and
+everything is overridable from env. The
 rig-local `~/ds4-sweep/ds4m-serve.sh` remains the A/B harness launcher, and
 `~/ds4-sweep/ds4m-prod.sh` is superseded by the repo script.
 
@@ -479,6 +514,7 @@ Follow-up feasibility result: conventional 4-GPU Lightning sharding is rejected.
 
 | DSV4_STABLE_TOPO=1 | (2026-08-04) constant prefill graph topology: pad the FA width even when already aligned | part of prefill +19% |
 | GGML_GALLOC_STICKY=1 | (2026-08-04) grow-only galloc plan per graph family; kills the per-ubatch realloc + all-GPU drain | part of prefill +19% |
+| DSV4_AGENT_CKPT_TAIL=1 | (2026-08-04) keep one tail checkpoint aligned to the 128-token DS4 compressor boundary | 296 -> 1,475 t/s on the first 10K agent append; correctness-safe host state |
 | GGML_SYNCLOG=1 | (2026-08-04) diagnostic: [SYNCLOG] realloc/sched-sync/ctx-sync counters + [GALLOCFAIL] node that overflowed the plan | — |
 | DSV4_RESERVE_FULL=1 | (2026-08-04) reserve the deep-prefill plan at n_ctx - n_ubatch; superseded by the sticky plan | neutral |
 | GGML_GALLOC_PAD=1 | (2026-08-04) grid-round planned sizes (max +19% headroom); partial, superseded by sticky | partial |
