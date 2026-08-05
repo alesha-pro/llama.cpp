@@ -3379,6 +3379,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph, bool * dsv4_
         if (dsv4_prefill_batch && node->op == GGML_OP_MUL_MAT_ID && node->ne[2] >= 64) {
             *dsv4_prefill_batch = true;
         }
+        static int dbg_mmid_dump = 0;
+        if (getenv("DSV4_GRAPH_DBG") && node->op == GGML_OP_MUL_MAT_ID && dbg_mmid_dump++ < 16) {
+            GGML_LOG_INFO("DSV4GDBG: mmid node=%d ne2=%lld as_type=%s as_ne2=%lld b_ne2=%lld ids_ne0=%lld\n",
+                i, (long long) node->ne[2], ggml_type_name(node->src[0]->type),
+                (long long) node->src[0]->ne[2], (long long) node->src[1]->ne[2], (long long) node->src[2]->ne[0]);
+        }
 
         if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
             continue;

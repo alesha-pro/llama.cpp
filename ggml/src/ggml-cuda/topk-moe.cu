@@ -309,6 +309,10 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
             topk_moe_cuda<144, has_bias><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used,
                                                                      clamp_val, scale_val, config);
             break;
+        case 160:
+            topk_moe_cuda<160, has_bias><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used,
+                                                                     clamp_val, scale_val, config);
+            break;
         case 256:
             topk_moe_cuda<256, has_bias><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used,
                                                                      clamp_val, scale_val, config);
