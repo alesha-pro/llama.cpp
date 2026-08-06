@@ -71,12 +71,18 @@ if [ -n "$FIT_TARGET" ]; then
     load_args+=(--fit-target "$FIT_TARGET")
 fi
 
+# EXTRA_ARGS supports quoted values (e.g. messages with spaces)
+extra_args=()
+if [ -n "$EXTRA_ARGS" ]; then
+    eval "extra_args=($EXTRA_ARGS)"
+fi
+
 setsid "$BIN" -m "$MODEL" \
     "${load_args[@]}" --split-mode layer --flash-attn on --no-repack \
     --ctx-size "$CTX" --batch-size "$BATCH" --ubatch-size "$UBATCH" \
     --ctx-checkpoints "$CTX_CHECKPOINTS" --checkpoint-every-n-tokens "$CHECKPOINT_EVERY_NT" \
     -t "$THREADS" --poll 100 --parallel 1 \
-    --host "$HOST" --port "$PORT" --jinja --alias ds4 $EXTRA_ARGS > "$LOG" 2>&1 &
+    --host "$HOST" --port "$PORT" --jinja --alias ds4 "${extra_args[@]}" > "$LOG" 2>&1 &
 SRV=$!
 
 for _ in $(seq 1 240); do

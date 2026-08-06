@@ -448,6 +448,87 @@ Prod launch: `MODEL=/mnt/ssd/models/DeepSeek-V4-Flash-0731-REAP-K160-Q3KQ4K-fina
 (the script warms to `n_ctx-512` itself; `EXTRA_ARGS` env hook added for
 one-off flags).
 
+## 0g. 2026-08-05/06: decode night — +13.1% short / +8.5% @130K, DSpark built and parked
+
+UD-IQ2_M, 131K ctx, temp 0, 256-token bursts via the prod server. Full
+per-hypothesis write-ups in `docs/ds4/DS4_H*_2026-08-0*.md`.
+
+```
+start (PL 220):              39.34 t/s short, 37.61 t/s @130K
+H0  PL 270 + -lgc 1995:      42.8           39.35
+H5+H6 kernels:               44.50          40.81
+prefill @32K on the final build: 1774 t/s (not hurt; 1675-1761 reference)
+```
+
+**H0 — power limit 270 W + locked SM clocks (`nvidia-smi -lgc 1995`).**
+Decode is insensitive to the power *limit* but the layer-split pipeline leaves
+each GPU idle most of the token, so DVFS droops between work windows. 1695 =
+baseline, 1995 = +8.8% short / +4.6% deep, 2130 = same, memory-clock lock =
+no-op. Prefill under the lock: 1761 t/s @32K (not hurt). Both settings need
+root and do not survive reboots — helper: `sudo bash scripts/ds4-gpu-clocks.sh`.
+
+**The decode profiling story (the real map).** nsys per-call numbers on this
+driver (custom 610.43.02 P2P build) are inflated ~100x, and graph-contained
+kernels are invisible to CUPTI in this nsys build — two artifacts that sent
+the first analysis wrong. The truth (LD_PRELOAD timing shims + caller-tagged
+SYNCLOG + dmon telemetry + microbenchmarks): **decode is one 21 ms serial GPU
+chain per token** — one llama_get_logits sync per token really waits 21 ms,
+all other syncs are 5-9 us; GPUs genuinely work (SM util 20-28%, ~200 W/card).
+GEMVs are ~65% of kernel time; the big Q8_0 attention projections already run
+at 0.77-0.80 TB/s of 0.936 peak, MoE expert GEMVs at 0.44-0.52 TB/s. Empty
+kernel graph replay is 0.58 us on this rig, so small kernels with internal
+serialization are the tax, not dispatch.
+
+**H5 — sinkhorn register rewrite (+4.1%).** `dsv4_hc_split_sinkhorn_f32`
+(20 iterations of a 4x4 matrix, 86 calls/token, 1 block per call) spent
+~1.3 us/iteration because runtime-bound loops spilled the matrix to local
+memory. Now a compile-time `N_HC=4` template, register-resident on 4 lanes,
+column reductions via butterfly shuffles: 28.8 -> 9.8 us/kernel standalone,
+42.8 -> 44.54 t/s e2e. Butterfly must shuffle the *accumulator* — the first
+version shuffled the original value and produced garbage ("DDDD..."), caught
+by the coherence check; standalone numeric test vs CPU reference at 1.1e-6.
+
+**H6 — fp8_kv_quantize two-pass (neutral, kept).** 21 block barriers per row
+-> 2, bit-exact. 44.54 -> 44.65 t/s.
+
+**H7 — MoE GEMV rows_per_block sweep (no-op).** `DSV4_MOE_GEMV_RPB` (1/2/4/8)
+all give 44.6; geometry is not the limiter, the vec_dot latency structure is.
+Real lever = ik_llama.cpp-style i-quant MMVQ port (IQ2_XXS/IQ3_XXS at
+0.44-0.52 TB/s), parked.
+
+**H2 — async input uploads (implemented, measured no-op).**
+`DSV4_ASYNC_INPUTS=1` moves the ~70 per-token input uploads off the blocking
+`ggml_backend_tensor_set` path (arena-ringed async H2D on the home device's
+compute stream + decode-mask content versioning). Zero speed change at any
+depth — the input syncs were 2.4 us each all along (nsys had shown 257 us).
+Code kept behind the flag, off by default.
+
+**H1 — DSpark speculative decode: fully built, validated, parked.**
+The 0731 checkpoint ships a 3-block DSpark draft module (`mtp.0/1/2`, 160
+pruned REAP experts each + markov bigram head). New converter
+`scripts/ds4-convert-mtp.py` builds draft GGUFs from the local REAP shards
+(Q4_K 6.9 GiB / Q3_K 5.4 / Q2_K 3.6, numerically verified 1.0 cossim). The
+fork's old-MTP branch (e_proj/h_proj, gone in 0731) was replaced with the real
+DSpark structure: layer-40/41/42 HC-mean taps -> `main_norm(main_proj(concat))`
+= main_x; per-block 128-row fp8 KV rings of `kv_norm(wkv(main_x))`; draft
+input = embedding broadcast over HC channels; 3 chained blocks; head from
+mtp.2 + **markov bias on draft logits** (mandatory — chain alone 7%, markov
+alone 2.6%, together 27.5%). Offline acceptance (teacher-forced, greedy):
+**27.5% docs / 26.8% code (Q4_K)**, 19.5% at Q2_K, live 13-21%. Live e2e is
+**negative** (17.8-19.4 vs 44 t/s): the draft adds ~30 ms/token of uncaptured
+kernels, and the VRAM fit forces Q2_K + cross-device overrides (working
+recipe: `TS=0.86,1.00,1.00,1.14` — layer boundaries come from
+`upper_bound(cum_ts, il/44)` — plus `-ot blk.4{1,2}.*_exps=CUDA{0,1}`,
+`DSV4_MTP_EMBD_DEV=CUDA1`, ctx 32768). Needed to make it a win, in order:
+draft ops captured in graphs, single-device draft (K160 base is REAP-native
+and frees the quant budget for Q4_K), then K>=2 block drafting.
+K=2 chained draft (`nc>=3`) is disabled pending a chain redesign.
+Details: `docs/ds4/DS4_H1_DSPARK_SPEC_2026-08-05.md`.
+
+Dead ends confirmed (no more time here): async inputs (H2), redundant
+ctx/sched syncs (5-9 us each), MoE RPB geometry, markov-only or
+single-block-mtp drafts.
+
 ## 1. The engine (fork)
 
 - On the rig: `/mnt/ssd/engines/llama.cpp-v4-cchuter`, branch **`ds4-longctx`**.
@@ -573,6 +654,17 @@ Follow-up feasibility result: conventional 4-GPU Lightning sharding is rejected.
 | DSV4_MTP_SPEC=1 + DSV4_MTP_GGUF | MTP speculative decode | decode ×1.2-1.5 |
 | DSV4_MTP_EMBD_DEV | (new, 06e8035) place tok_embd mirror device — VRAM valve | — |
 
+(2026-08-06 additions, section 0g)
+
+| Flag | Effect | Gain |
+|---|---|---|
+| `nvidia-smi -lgc 1995` (+ `-pl 270`) | not an env flag: lock SM clocks, removes DVFS droop between layer-split windows | **+8.8% decode short, +4.6% @130K**, prefill flat |
+| DSV4_ASYNC_INPUTS=1 | async per-token input uploads (arena ring + mask content versioning) | no-op (kept, off) |
+| DSV4_MTP_SPEC=1 + DSV4_MTP_GGUF=<dspark gguf> + `--spec-type dsv4-mtp` | DSpark 3-block speculative decode for 0731 (works, acceptance 13-27%) | **net negative e2e now** — parked |
+| DSV4_MTP_NO_MARKOV / DSV4_MTP_MARKOV_ONLY | ablations for the DSpark acceptance test | diagnostics |
+| DSV4_MOE_GEMV_RPB | mul_mat_vec_q_moe rows_per_block override (1/2/4/8) | no-op, keep 2 |
+| sinkhorn/fp8kv kernels (not flags) | register-resident sinkhorn N_HC=4 template; 2-pass fp8 quantizer | **+4.1% / +0.2% decode** |
+
 | DSV4_STABLE_TOPO=1 | (2026-08-04) constant prefill graph topology: pad the FA width even when already aligned | part of prefill +19% |
 | GGML_GALLOC_STICKY=1 | (2026-08-04) grow-only galloc plan per graph family; kills the per-ubatch realloc + all-GPU drain | part of prefill +19% |
 | DSV4_AGENT_CKPT_TAIL=1 | (2026-08-04) keep one tail checkpoint aligned to the 128-token DS4 compressor boundary | 296 -> 1,475 t/s on the first 10K agent append; correctness-safe host state |
@@ -637,6 +729,17 @@ Power limit is NOT persistent across reboots (something sets 220 at boot).
 ```
 Historic headline: CPU-fallback fix took prefill 31.6 → 531 t/s (a 23.5K prompt
 from 25 min to 53 sec). This is the "×29" hook of the X thread.
+
+2026-08-06, **current production config** (UD-IQ2_M, 131K, PL 270 + `-lgc 1995`,
+sinkhorn/fp8kv kernels of section 0g):
+
+```
+short ctx:  44.50 t/s decode (39.34 at the start of 08-05, +13.1%)
+~130K:      40.81 t/s decode (37.61, +8.5%)
+32K:        1774 t/s prefill (not hurt by the clock lock)
+PL/clocks are runtime-only: sudo bash scripts/ds4-gpu-clocks.sh after reboot.
+```
+
 
 ## 7. Key engine findings (the substance for a research agent)
 
@@ -789,18 +892,32 @@ Two viable designs, in build order:
 
 ### Parked by decision (recon done, so it is cheap to restart)
 
-**MTP head for 0731.** Alexey's call was to skip it this session, but the
-groundwork is done and worth not re-deriving: the MTP tensors live in shards
-46-48 of `deepseek-ai/DeepSeek-V4-Flash-0731` (4705 tensors, ~10.9 GB, so a
-partial download is enough), `convert_hf_to_gguf.py` in this fork already knows
-`model.mtp_block.N` / `mtp_emb_norm` / `skip_mtp`, and the runtime loader
-(`dsv4_mtp_get` in `src/models/deepseek4.cpp`) accepts *any* GGUF whose tensors
-are named `mtp.0.*` — it just reads them onto `DSV4_MTP_DEV`. The work is the
-name mapping (HF `mtp.0.attn.wq_a.weight` + `.scale` → the fork's flat names),
-the FP8 scale handling, and merging 256 per-expert tensors. On the previous
-checkpoint MTP was worth +31% short / +20% deep decode.
+**MTP head for 0731.** Superseded 2026-08-06: the 0731 checkpoint's draft is
+the 3-block **DSpark** module, and the full port now lives in the tree
+(converter `scripts/ds4-convert-mtp.py`, chained-block graph, live phase B) —
+see section 0g and `docs/ds4/DS4_H1_DSPARK_SPEC_2026-08-05.md` for why it is
+built but parked (acceptance/VRAM/draft-capture). The old note: MTP tensors
+live in shards 46-48 of `deepseek-ai/DeepSeek-V4-Flash-0731` (also present
+locally in the REAP repo), `convert_hf_to_gguf.py` knows `model.mtp_block.N` /
+`mtp_emb_norm` / `skip_mtp`, and the runtime loader (`dsv4_mtp_get` in
+`src/models/deepseek4.cpp`) accepts any GGUF with `mtp.N.*` names.
 
 ## 9. All documentation and content (verified locations)
+
+2026-08-06 decode night (section 0g), one file per hypothesis in `docs/ds4/`:
+
+- `DS4_H0_LOCK_CLOCKS_2026-08-05.md` — PL 270 + `-lgc 1995`, +8.8%/+4.6%.
+- `DS4_HPROF_DECODE_SYNCS_2026-08-05.md` — the (nsys-distorted) sync profile.
+- `DS4_HPROF2_DECODE_CHAIN_2026-08-05.md` — the corrected picture: decode is a
+  21 ms serial GPU chain; syncs are innocent; profiling-methodology notes.
+- `DS4_H2_ASYNC_INPUTS_2026-08-05.md` — async inputs: implemented, no-op.
+- `DS4_H1_DSPARK_SPEC_2026-08-05.md` — DSpark: build, acceptance table, live
+  e2e, VRAM fit recipe, next steps.
+- `DS4_H5_H7_DECODE_KERNELS_2026-08-06.md` — sinkhorn/fp8kv/RPB kernel work +
+  cumulative numbers + parked follow-ups.
+- Scripts: `scripts/ds4-convert-mtp.py` (DSpark draft GGUF converter),
+  `scripts/ds4-decode-bench.py` (short/deep decode bench against a live
+  server), `scripts/ds4-gpu-clocks.sh` (PL 270 + `-lgc 1995` in one sudo call).
 
 **Measurement harness (2026-08-04, on the rig at `~/ds4-sweep/`)** — reuse it
 rather than rebuilding one:
