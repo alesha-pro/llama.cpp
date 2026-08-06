@@ -27,11 +27,28 @@
 struct cb_state {
     std::vector<int32_t> draft;
     bool got = false;
+    std::vector<float> input_hc, main_x, logits;
+    int64_t input_hc_ne[3] = {0,0,0};
+    int64_t main_x_ne[2] = {0,0};
+    int64_t logits_ne[2] = {0,0};
 };
+
+static void cb_grab(ggml_tensor * t, const char * name, std::vector<float> & dst, int64_t * ne, int nd) {
+    if (strcmp(t->name, name) != 0 || t->type != GGML_TYPE_F32) {
+        return;
+    }
+    dst.resize(ggml_nelements(t));
+    ggml_backend_tensor_get(t, dst.data(), 0, ggml_nbytes(t));
+    for (int i = 0; i < nd; ++i) ne[i] = t->ne[i];
+}
 
 static bool eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     cb_state * s = (cb_state *) user_data;
     if (ask) {
+        if (getenv("DSV4_ACCEPT_DBG") != nullptr &&
+            (!strcmp(t->name, "mtp_input_hc") || !strcmp(t->name, "mtp_main_x") || !strcmp(t->name, "mtp_draft_logits"))) {
+            return true;
+        }
         return strcmp(t->name, "mtp_draft_tok") == 0;
     }
     if (strcmp(t->name, "mtp_draft_tok") == 0) {
@@ -39,7 +56,21 @@ static bool eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         ggml_backend_tensor_get(t, s->draft.data(), 0, ggml_nbytes(t));
         s->got = true;
     }
+    cb_grab(t, "mtp_input_hc", s->input_hc, s->input_hc_ne, 3);
+    cb_grab(t, "mtp_main_x", s->main_x, s->main_x_ne, 2);
+    cb_grab(t, "mtp_draft_logits", s->logits, s->logits_ne, 2);
     return true;
+}
+
+static void dump_f32(const char * path, const std::vector<float> & v, const int64_t * ne, int nd) {
+    FILE * f = fopen(path, "wb");
+    if (!f) return;
+    int64_t n = 1; for (int i = 0; i < nd; ++i) n *= ne[i];
+    fprintf(f, "nds=%d shape=", nd);
+    for (int i = 0; i < nd; ++i) fprintf(f, "%lld%s", (long long) ne[i], i+1<nd?",":"\n");
+    fwrite(v.data(), sizeof(float), n, f);
+    fclose(f);
+    fprintf(stderr, "DBG dumped %s (%ld floats)\n", path, (long) n);
 }
 
 int main(int argc, char ** argv) {
@@ -144,12 +175,24 @@ int main(int argc, char ** argv) {
 
         const float * lg = llama_get_logits(ctx);
         long c_all = 0, n_all = 0, c_deep = 0, n_deep = 0;
+        static const bool dbg = getenv("DSV4_ACCEPT_DBG") != nullptr;
+        if (dbg && pos == 0) {
+            fprintf(stderr, "DBG j | draft | base_argmax | actual_next\n");
+            dump_f32("/tmp/ds4dbg-input-hc.bin", st.input_hc, st.input_hc_ne, 3);
+            dump_f32("/tmp/ds4dbg-main-x.bin", st.main_x, st.main_x_ne, 2);
+            dump_f32("/tmp/ds4dbg-logits.bin", st.logits, st.logits_ne, 2);
+        }
         for (int j = 1; j < nt; ++j) {
             const float * row = lg + (size_t) j * n_vocab;
             int best = 0;
             float bv = row[0];
             for (int v = 1; v < n_vocab; ++v) {
                 if (row[v] > bv) { bv = row[v]; best = v; }
+            }
+            if (dbg && pos == 0 && j <= 24) {
+                fprintf(stderr, "DBG %3d | %7d | %7d | %7d | row0=%.3f row1=%.3f isnan=%d\n",
+                        j, st.draft[j], best, toks[pos + j + 1 < total ? pos + j + 1 : total - 1],
+                        row[0], row[1], row[0] != row[0]);
             }
             const bool hit = st.draft[j] == best;
             n_all++; c_all += hit;
