@@ -704,16 +704,40 @@ static void mul_mat_vec_q_moe_launch(
         const uint32_t ncols_dst, const uint32_t ids_stride,
         const int warp_size, const int nchannels_dst, cudaStream_t stream) {
 
-    constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
+    static const int rows_per_block = [] {
+        const char * e = getenv("DSV4_MOE_GEMV_RPB");
+        return e ? atoi(e) : 2; // 2 gives best perf based on tuning
+    }();
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
     const dim3 block_nums(nblocks_rows, nchannels_dst);
     const dim3 block_dims(warp_size, ncols_dst);
 
-    mul_mat_vec_q_moe<type, rows_per_block><<<block_nums, block_dims, 0, stream>>>(
-        vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
-        stride_row_x, stride_col_y, stride_col_dst,
-        stride_channel_x, stride_channel_y, stride_channel_dst,
-        ncols_dst, ids_stride);
+    switch (rows_per_block) {
+        case 1: mul_mat_vec_q_moe<type, 1><<<block_nums, block_dims, 0, stream>>>(
+                vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst,
+                ncols_dst, ids_stride);
+            break;
+        case 4: mul_mat_vec_q_moe<type, 4><<<block_nums, block_dims, 0, stream>>>(
+                vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst,
+                ncols_dst, ids_stride);
+            break;
+        case 8: mul_mat_vec_q_moe<type, 8><<<block_nums, block_dims, 0, stream>>>(
+                vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst,
+                ncols_dst, ids_stride);
+            break;
+        default: mul_mat_vec_q_moe<type, 2><<<block_nums, block_dims, 0, stream>>>(
+                vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst,
+                ncols_dst, ids_stride);
+            break;
+    }
 }
 
 template <ggml_type type>

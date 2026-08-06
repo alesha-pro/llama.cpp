@@ -71,6 +71,10 @@ static __device__ __forceinline__ float warp_reduce_max(float v) {
 }
 
 // One block per row. blockDim.x == 64 (two warps).
+// Two passes over the row with only two block-wide barriers: pass 1 computes
+// the per-64-element-block maxima into shared memory, pass 2 quantizes with
+// the resolved scales. (The previous version took 3 __syncthreads per
+// 64-element block = 21 barriers per row.)
 static __global__ void dsv4_fp8_kv_quantize_f32(
         const char * __restrict__ src,
         char       * __restrict__ dst,
@@ -95,38 +99,34 @@ static __global__ void dsv4_fp8_kv_quantize_f32(
     char       * dst_base = dst + i1*nb1  + i2*nb2  + i3*nb3;
 
     const int64_t n_nope = ne00 - (int64_t) n_rot;
+    const int     n_blk  = (int) (n_nope >> 6);         // 64-element blocks
 
-    // Shared-mem slot for the two warps' partial max.
-    __shared__ float warp_max[2];
+    // shared: per-block scale after combination
+    __shared__ float blk_scale[64];
+    __shared__ float part_max[64][2];
 
-    // Prefix loop: 64-element blocks.
-    for (int64_t off = 0; off < n_nope; off += 64) {
-        const float v = *(const float *)(src_base + (off + tid) * nb00);
-
-        // Two-stage block-max reduction across 64 threads.
-        // Stage 1: each warp reduces its 32 lanes via shfl_xor; lane 0 stores
-        //          the warp's max to shared memory.
-        // Stage 2: a single thread (warp 0, lane 0) combines the two warp maxes
-        //          and writes the final block max back to warp_max[0].
+    // pass 1: thread tid handles element (b*64 + tid) of block b
+    for (int b = 0; b < n_blk; ++b) {
+        const float v = *(const float *)(src_base + ((int64_t) b * 64 + tid) * nb00);
         float m = warp_reduce_max(fabsf(v));
-        if (lane == 0) warp_max[warp_id] = m;
-        __syncthreads();
-        if (warp_id == 0 && lane == 0) {
-            warp_max[0] = fmaxf(warp_max[0], warp_max[1]);
-        }
-        __syncthreads();
+        if (lane == 0) part_max[b][warp_id] = m;
+    }
+    __syncthreads();
+    if (tid < n_blk) {
+        blk_scale[tid] = exp2f(ceilf(log2f(fmaxf(fmaxf(part_max[tid][0], part_max[tid][1]), 1.0e-4f) / 448.0f)));
+    }
+    __syncthreads();
 
-        const float amax  = fmaxf(warp_max[0], 1.0e-4f);
-        const float scale = exp2f(ceilf(log2f(amax / 448.0f)));
-
+    // pass 2: quantize + store
+    for (int b = 0; b < n_blk; ++b) {
+        const int64_t off = (int64_t) b * 64 + tid;
+        const float v = *(const float *)(src_base + off * nb00);
+        const float scale = blk_scale[b];
         const float q = dsv4_e4m3fn_roundtrip(fminf(fmaxf(v / scale, -448.0f), 448.0f)) * scale;
-        *(float *)(dst_base + (off + tid) * nb0) = q;
-
-        __syncthreads();  // protect warp_max for the next block
+        *(float *)(dst_base + off * nb0) = q;
     }
 
     // Tail loop: copy n_rot elements per row through unchanged.
-    // 64 threads stride through the tail.
     for (int64_t i = n_nope + tid; i < ne00; i += 64) {
         *(float *)(dst_base + i * nb0) = *(const float *)(src_base + i * nb00);
     }
@@ -146,6 +146,7 @@ void ggml_cuda_op_dsv4_fp8_kv_quantize(ggml_backend_cuda_context & ctx, ggml_ten
     GGML_ASSERT(n_rot >= 0);
     GGML_ASSERT(n_nope > 0);
     GGML_ASSERT(n_nope % 64 == 0);
+    GGML_ASSERT(n_nope <= 4096); // shared-mem per-block tables in the 2-pass kernel
 
     const int64_t n_rows = src->ne[1] * src->ne[2] * src->ne[3];
 
