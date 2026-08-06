@@ -43,6 +43,14 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * f
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
+// Async H2D write of a (small) input tensor directly on the home device's
+// compute stream, WITHOUT the host-blocking sync that ggml_backend_tensor_set
+// does. Ordering with later compute/graph launches on the same stream is
+// guaranteed by stream order; the caller must keep the source buffer alive
+// until the device work has drained (e.g. persistent staging). Falls back to
+// the blocking set for non-CUDA buffers.
+GGML_BACKEND_API void ggml_backend_cuda_tensor_set_input_async(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
 #ifdef  __cplusplus

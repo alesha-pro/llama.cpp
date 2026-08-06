@@ -6094,6 +6094,35 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
     return &reg;
 }
 
+// device -> live backend context registry, used to reach the device's compute
+// stream from tensor-only call sites (per-token input uploads).
+static ggml_backend_cuda_context * g_cuda_backend_ctxs[GGML_CUDA_MAX_DEVICES] = {};
+
+static void ggml_cuda_register_backend_ctx(int device, ggml_backend_cuda_context * ctx) {
+    if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
+        g_cuda_backend_ctxs[device] = ctx;
+    }
+}
+
+void ggml_backend_cuda_tensor_set_input_async(ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_backend_buffer_t buf = tensor->view_src != nullptr ? tensor->view_src->buffer : tensor->buffer;
+    if (buf == nullptr || buf->iface.set_tensor != ggml_backend_cuda_buffer_set_tensor) {
+        // not a plain CUDA device buffer (host/split/none): keep semantics safe
+        if (buf != nullptr) {
+            buf->iface.set_tensor(buf, tensor, data, offset, size);
+        }
+        return;
+    }
+    ggml_backend_cuda_buffer_context * buf_ctx = (ggml_backend_cuda_buffer_context *) buf->context;
+    ggml_backend_cuda_context * ctx = g_cuda_backend_ctxs[buf_ctx->device];
+    if (ctx == nullptr) {
+        buf->iface.set_tensor(buf, tensor, data, offset, size);
+        return;
+    }
+    ggml_cuda_set_device(buf_ctx->device);
+    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, ctx->stream()));
+}
+
 ggml_backend_t ggml_backend_cuda_init(int device) {
     if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
         GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
@@ -6112,6 +6141,8 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
         /* .context = */ ctx,
     };
+
+    ggml_cuda_register_backend_ctx(device, ctx);
 
     return cuda_backend;
 }

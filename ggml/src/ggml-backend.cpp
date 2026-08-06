@@ -1922,7 +1922,7 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     {
         static int synclog_sched_n = 0;
         if (getenv("GGML_SYNCLOG") != NULL) {
-        GGML_LOG_INFO("[SYNCLOG] schedsync #%d t=%.3f\n", ++synclog_sched_n, ggml_time_us()/1e6);
+        GGML_LOG_INFO("[SYNCLOG] schedsync #%d t=%.3f caller=%p\n", ++synclog_sched_n, ggml_time_us()/1e6, __builtin_return_address(0));
         }
     }
     GGML_ASSERT(sched);

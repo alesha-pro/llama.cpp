@@ -664,17 +664,22 @@ void llama_context::sched_reserve() {
 }
 
 void llama_context::synchronize() {
-    {
+    static const bool synclog = getenv("GGML_SYNCLOG") != NULL;
+    int64_t t_sync_start = 0;
+    if (synclog) {
         static int synclog_ctx_n = 0;
-        if (getenv("GGML_SYNCLOG") != NULL) {
-        LLAMA_LOG_INFO("[SYNCLOG] ctxsync #%d t=%.3f\n", ++synclog_ctx_n, ggml_time_us()/1e6);
-        }
+        t_sync_start = ggml_time_us();
+        LLAMA_LOG_INFO("[SYNCLOG] ctxsync #%d t=%.3f caller=%p\n", ++synclog_ctx_n, t_sync_start/1e6, __builtin_return_address(0));
     }
     if (!sched) {
         return;
     }
 
     ggml_backend_sched_synchronize(sched.get());
+
+    if (synclog) {
+        LLAMA_LOG_INFO("[SYNCLOG] ctxsync-done dur=%.3f ms caller=%p\n", (ggml_time_us() - t_sync_start)/1e3, __builtin_return_address(0));
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
