@@ -2,6 +2,78 @@
 
 This branch runs the full DeepSeek-V4-Flash 284B MoE (2-bit expert GGUF, 85-91 GB) on four RTX 3090s: 96 GB of VRAM total, sm_86, no FP8, PCIe only. It builds on cchuter's V4 CUDA port. Every change sits behind a `DSV4_*` environment variable; with the flags unset the code paths are stock.
 
+Two checkpoints are supported on this 96 GB rig: the full 284B model at 2-bit (Unsloth UD-IQ2_M) with **131K context**, or the REAP-pruned 180B at ~4-bit ([K160 GGUF](https://huggingface.co/anonymousmaharaj/DeepSeek-V4-Flash-0731-REAP-K160-GGUF)) with **262K context** — same VRAM budget, quality parity between them (see the 2026-08-05 section below).
+
+## 2026-08-06: decode night — 39.3 → 44.5 t/s (+13%), prefill untouched
+
+One night of decode optimization on the UD-IQ2_M config (131K ctx, temp 0,
+256-token bursts through the prod server):
+
+| step | decode, short ctx | decode @130K |
+|---|---:|---:|
+| start (220 W power limit) | 39.34 t/s | 37.61 t/s |
+| + clocks locked at 1995 MHz, 270 W ([scripts/ds4-gpu-clocks.sh](scripts/ds4-gpu-clocks.sh)) | 42.8 t/s | 39.35 t/s |
+| + sinkhorn / fp8-KV quantize kernel rewrites | **44.50 t/s** | **40.81 t/s** |
+
+Prefill is not hurt: 1,774 t/s @32K on the final build (1,675-1,761
+reference). The wins came from a register-based fast path for the
+head-compression split sinkhorn (shuffle reductions over the accumulator) and
+a two-pass, bit-exact fp8 KV quantize kernel. Decode is a ~21 ms serial GPU
+chain per token; syncs were profiled and are not the problem — the next lever
+is MoE expert GEMV bandwidth (i-quant MMVQ port, parked). A DSpark
+speculative-decoding port is built and measured but also parked: acceptance
+27.5% with a Q4_K draft, yet e2e is slower than plain decode because the
+draft runs uncaptured and costs VRAM. Per-hypothesis write-ups live in
+[docs/ds4/](docs/ds4/) (`DS4_H*_2026-08-0*.md`).
+
+## 2026-08-05: REAP K160 GGUF — 256K context on 96 GB, quality parity with the 2-bit full model
+
+[anonymousmaharaj/DeepSeek-V4-Flash-0731-REAP-K160-GGUF](https://huggingface.co/anonymousmaharaj/DeepSeek-V4-Flash-0731-REAP-K160-GGUF)
+is a GGUF of [0xSero's REAP K160 checkpoint](https://huggingface.co/0xSero/DeepSeek-V4-Flash-0731-REAP)
+(160 of 256 routed experts kept per MoE scope, 180.4B params after pruning),
+converted in-house on this branch: routed experts Q3_K/Q4_K (down-proj is the
+sensitive one and gets Q4_K), attention/shared experts/indexer/output Q8_0,
+compressor APE tensors pinned to F32, chat template embedded. 89.9 GB, 3.99
+bpw, four shards.
+
+Same 90 GB budget, two ways to spend it:
+
+| checkpoint | parameters | weight bits | max context on 96 GB |
+|---|---:|---:|---:|
+| Unsloth UD-IQ2_M (unpruned) | 284B | 2.56 bpw | **131,072** |
+| REAP K160 Q3_K/Q4_K (this repo) | 180B | 3.99 bpw | **262,144** |
+
+Quality A/B at temperature 0 (benchlocal-cli, 150 scenarios):
+
+| pack | K160 Q3_K/Q4_K | UD-IQ2_M |
+|---|---:|---:|
+| medium (ToolCall / InstructFollow / StructOutput / DataExtract / ReasonMath, 75) | 67 | 67 |
+| cli-40 | 23 | 22 |
+| hermesagent-20 | 14 | 14 |
+| bugfind-15 | 14 | 14 |
+| **total** | **118/150** | **117/150** |
+
+One scenario out of 150 is noise — read it as a tie. The error profiles
+differ: K160 wins investigation and multi-step scenarios, the 2-bit build
+wins exact-format text tasks. Known limitation: non-English output (tested
+with Russian) is broken on the K160 build — that comes from the expert
+pruning, not the quantization, so use UD-IQ2_M if you need anything but
+English.
+
+Speed on the rig (262,144 ctx, ~92/96 GB filled, 350 W): prefill 1,675 t/s
+@32K, 1,766-1,771 t/s @64-130K, marginal ~1,830-1,850 t/s; decode 34-36 t/s
+(up to 38.9 t/s on single requests). Launch it exactly like the UD
+checkpoint, with a bigger context:
+
+```bash
+MODEL=/path/to/DeepSeek-V4-Flash-0731-REAP-K160-Q3_K_Q4_K-00001-of-00004.gguf \
+CTX=262144 bash scripts/ds4-prod-serve.sh
+```
+
+Full conversion recipe, conversion traps (transformers pin, APE/F32, chat
+template injection) and quality details: [DS4HANDOFF.md](DS4HANDOFF.md)
+section 0f.
+
 ## 2026-08-04: capture-always CUDA graphs — prefill 433 → 1,900 t/s in one session
 
 Prefill was host-bound: one thread pushing ~1,700 kernel launches per ubatch
@@ -71,7 +143,7 @@ The 105K row uses the older `-ts 1,1,1,0.85` split; the two deeper rows use
 - MoE MMQ tile fix (`DSV4_MOE_TILE`): the ids path sized tiles for the worst-case column bound, which wasted 87% of the MACs at ubatch 512. Sizing from the actual per-expert token count gave +19% end to end. Related finding: IQ2_XXS runs 1.74x faster than Q2_K in MMQ on Ampere.
 - Lightning indexer variants: causal skip (`DSV4_IDX_SKIP`), a q-tiled WMMA kernel for 200K+ depths (`DSV4_IDX_QTILE`).
 - Constant-shape decode graphs (`DSV4_CONSTANT_SHAPE`): depth-bucketed shapes so CUDA graphs replay instead of rebuilding every token.
-- MTP speculative decoding, K=1, end to end: the MTP head is side-loaded from a separate GGUF (`DSV4_MTP_GGUF`), drafts are computed inside the main graph, and llama-server picks them up via `--spec-type dsv4-mtp`. Accept rate is 85-100% on greedy decoding.
+- MTP speculative decoding, K=1, end to end: the MTP head is side-loaded from a separate GGUF (`DSV4_MTP_GGUF`), drafts are computed inside the main graph, and llama-server picks them up via `--spec-type dsv4-mtp`. Accept rate is 85-100% on greedy decoding. Note (2026-08): this legacy MTP path has been superseded in `src/models/deepseek4.cpp` by a DSpark port (layer taps + markov bias, built via `scripts/ds4-convert-mtp.py`) that is measured but currently parked — slower e2e than plain decode; see [docs/ds4/DS4_H1_DSPARK_SPEC_2026-08-05.md](docs/ds4/DS4_H1_DSPARK_SPEC_2026-08-05.md).
 - Tool-call fixes for agent clients: the DSML parser now accepts tool parameters in any order. Before this, a well-formed call failed to parse whenever the model ordered parameters differently from the JSON schema, so clients such as opencode never executed the tool.
 - MMVQ `small_k` boundary fix (`DSV4_MMVQ_SMALLK`): both routed expert matmuls land exactly on the `small_k` trigger that a strict `<` excludes — IQ2_XXS up/gate at `4096/256 = 16` blocks against a threshold of 16, Q2_K down at `2048/256 = 8` against 8. Relaxing it to `<=` gives +5% decode with prefill unchanged.
 - Batched radix-select Top-K for prefill (`DSV4_PREFILL_RADIX_TOPK`): the prefill indexer top-k went through `ggml_argsort_top_k`, which fully sorts the compressed width and allocates a `[n_comp, n_tokens]` i32 result plus CUB temp storage — both scaling with context, and both fatal past ~90K tokens. Replaced with a one-block-per-row radix-select behind `GGML_OP_TOP_K` that needs no context-scaled scratch. Same prefill speed, no ceiling.
@@ -209,6 +281,11 @@ Two operational rules learned the hard way:
   the cards peaking at 83 C in bursts.
 
 ### Earlier checkpoint (IQ2_XXS + MTP)
+
+> Historical numbers, measured before the 2026-08 DSpark rewrite of the MTP
+> path — treat the launch below as a record of that checkpoint, not a current
+> production recipe. Today's production configs are UD-IQ2_M (131K) and REAP
+> K160 (262K), both launched via `scripts/ds4-prod-serve.sh`.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 GGML_CUDA_P2P=1 \
