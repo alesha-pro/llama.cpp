@@ -783,6 +783,9 @@ extern "C" {
     GGML_API bool ggml_is_contiguous_1(const struct ggml_tensor * tensor); // contiguous for dims >= 1
     GGML_API bool ggml_is_contiguous_2(const struct ggml_tensor * tensor); // contiguous for dims >= 2
 
+    // returns whether dimensions 0 through 2 are contiguous; dimension 3 may be a strided view
+    GGML_API bool ggml_is_contiguous_to_3(const struct ggml_tensor * tensor);
+
     // returns whether the tensor elements are allocated as one contiguous block of memory (no gaps, but permutation ok)
     GGML_API bool ggml_is_contiguously_allocated(const struct ggml_tensor * tensor);
 

@@ -1,5 +1,7 @@
 #include "concat.cuh"
 
+#include <stdint.h>
+
 // contiguous kernels
 template <typename T, int dim>
 static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_cont(const T * x,
@@ -173,54 +175,77 @@ static void concat_non_cont_cuda(const ggml_tensor * src0,
     }
 }
 
+template <typename T>
+static void concat_cuda(
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst,
+        int dim,
+        cudaStream_t stream) {
+    if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
+        const T * src0_d = (const T *) src0->data;
+        const T * src1_d = (const T *) src1->data;
+        T *       dst_d  = (T *) dst->data;
+
+        for (int64_t i3 = 0; i3 < dst->ne[3]; ++i3) {
+            concat_cont_cuda(
+                    src0_d + i3*(src0->nb[3]/sizeof(T)),
+                    src1_d + i3*(src1->nb[3]/sizeof(T)),
+                    dst_d  + i3*( dst->nb[3]/sizeof(T)),
+                    ggml_row_size(src0->type, src0->ne[0])/sizeof(T), src0->ne[1], src0->ne[2],
+                    ggml_row_size(dst->type,  dst->ne[0])/sizeof(T),   dst->ne[1],  dst->ne[2], dim, stream);
+        }
+    } else if (dim == 3 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+        const size_t size0 = ggml_nbytes(src0);
+        const size_t size1 = ggml_nbytes(src1);
+        CUDA_CHECK(cudaMemcpyAsync((char *) dst->data,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
+    } else {
+        GGML_ASSERT(!ggml_is_quantized(src0->type));
+        concat_non_cont_cuda<T>(src0, src1, dst, dim, stream);
+    }
+}
+
 void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
-
+    const int32_t dim = ((int32_t *) dst->op_params)[0];
     cudaStream_t stream = ctx.stream();
 
-    const int32_t dim = ((int32_t *) dst->op_params)[0];
-
-    // F32 is the common case (mul_mat/norm/rope outputs). F16 is needed by
-    // DeepSeek-V4 decode, which concatenates the F16 KV cache directly instead
-    // of round-tripping through F32. All three tensors must share one type.
     GGML_ASSERT(src0->type == src1->type);
-    GGML_ASSERT(src0->type == dst->type);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
+    GGML_ASSERT(dst->type == src0->type);
 
-    if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
-        if (dim != 3) {
-            for (int i3 = 0; i3 < dst->ne[3]; i3++) {
-                const char * src0_d = (const char *) src0->data + i3 * src0->nb[3];
-                const char * src1_d = (const char *) src1->data + i3 * src1->nb[3];
-                char *       dst_d  = (char *)       dst->data  + i3 * dst->nb[3];
-
-                if (dst->type == GGML_TYPE_F16) {
-                    concat_cont_cuda<half>(
-                            (const half *) src0_d, (const half *) src1_d, (half *) dst_d,
-                            src0->ne[0], src0->ne[1], src0->ne[2],
-                            dst->ne[0],  dst->ne[1],  dst->ne[2], dim, stream);
-                } else {
-                    concat_cont_cuda<float>(
-                            (const float *) src0_d, (const float *) src1_d, (float *) dst_d,
-                            src0->ne[0], src0->ne[1], src0->ne[2],
-                            dst->ne[0],  dst->ne[1],  dst->ne[2], dim, stream);
-                }
-            }
+    if (ggml_is_quantized(src0->type)) {
+        if (dim == 3) {
+            GGML_ASSERT(ggml_is_contiguous(src0));
+            GGML_ASSERT(ggml_is_contiguous(src1));
         } else {
-            const size_t size0 = ggml_nbytes(src0);
-            const size_t size1 = ggml_nbytes(src1);
-
-            char * dst_d = (char *) dst->data;
-
-            CUDA_CHECK(cudaMemcpyAsync(dst_d,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(dst_d + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
+            GGML_ASSERT(ggml_is_contiguous_to_3(src0));
+            GGML_ASSERT(ggml_is_contiguous_to_3(src1));
         }
-    } else {
-        if (dst->type == GGML_TYPE_F16) {
-            concat_non_cont_cuda<half>(src0, src1, dst, dim, stream);
-        } else {
-            concat_non_cont_cuda<float>(src0, src1, dst, dim, stream);
-        }
+        GGML_ASSERT(src0->ne[0] % ggml_blck_size(src0->type) == 0);
+        GGML_ASSERT(src1->ne[0] % ggml_blck_size(src1->type) == 0);
+
+        // Quantized rows are copied as packed bytes, not as logical elements.
+        concat_cuda<uint8_t>(src0, src1, dst, dim, stream);
+        return;
+    }
+
+    GGML_ASSERT(ggml_blck_size(src0->type) == 1);
+    switch (ggml_type_size(src0->type)) {
+        case 1:
+            concat_cuda<uint8_t>(src0, src1, dst, dim, stream);
+            break;
+        case 2:
+            concat_cuda<uint16_t>(src0, src1, dst, dim, stream);
+            break;
+        case 4:
+            concat_cuda<uint32_t>(src0, src1, dst, dim, stream);
+            break;
+        case 8:
+            concat_cuda<uint64_t>(src0, src1, dst, dim, stream);
+            break;
+        default:
+            GGML_ABORT("Unsupported concat type size: %zu", ggml_type_size(src0->type));
     }
 }
