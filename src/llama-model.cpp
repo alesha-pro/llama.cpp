@@ -2428,34 +2428,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     return hparams.attn_compress_ratio[il] != 0;
                 };
 
-                // V4's standard SWA K cache, compressed-attention K cache
-                // (cache.attn_k), and indexer K cache (cache.index_k) all
-                // share the same `type_k` and must agree in dtype because
-                // src/models/deepseek4.cpp concatenates the SWA K view with
-                // the compressed K view via ggml_concat (which asserts
-                // a->type == b->type). Furthermore, V4's K activations are
-                // post-fp8-quantized (ggml_dsv4_fp8_kv_quantize), and q8_0's
-                // single fp16 scale per 32-element block cannot faithfully
-                // reproduce fp8-quantized value distributions -- pinning to
-                // q8_0 corrupts decode silently ("=" loops, "Mirror ..."
-                // garbage). Force fp16 unconditionally for V4 KV caches.
-                //
-                // NOTE: the user-facing WARN and the params.type_k/type_v
-                // coercion already happen earlier in llama_init_from_model
-                // (src/llama-context.cpp), BEFORE the shared
-                // SPLIT_MODE_TENSOR / V-quant-requires-FA validations run,
-                // so users requesting q8_0 KV with V4 don't trip those
-                // checks. The fp16 pin here is a defense-in-depth safety
-                // net for any direct callers of create_memory() that
-                // bypass llama_init_from_model. See
-                // docs/plans/v4-port-kv-q8-completion.md.
-                ggml_type v4_type_k = GGML_TYPE_F16;
-                ggml_type v4_type_v = GGML_TYPE_F16;
-
+                // llama_init_from_model validates DeepSeek V4 cache types and
+                // the required rotation safety switch before reaching here.
                 res = new llama_memory_hybrid_iswa(
                         /* model             */ *this,
-                        /* attn_type_k       */ v4_type_k,
-                        /* attn_type_v       */ v4_type_v,
+                        /* attn_type_k       */ params.type_k,
+                        /* attn_type_v       */ params.type_v,
                         /* attn_v_trans      */ !cparams.flash_attn,
                         /* attn_swa_full     */ params.swa_full,
                         /* attn_kv_size      */ cparams.n_ctx_seq,

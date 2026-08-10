@@ -969,10 +969,17 @@ static void dsv4_pad_fattn_width(ggml_context * ctx, ggml_tensor ** k_all, ggml_
         }
         pad = 256;
     }
-    // NB: CUDA ggml_pad asserts F32, so pad K via an F16 zero-fill + concat
-    // (fill.cu supports F16).
-    ggml_tensor * kz = ggml_fill(ctx,
-            ggml_new_tensor_3d(ctx, (*k_all)->type, (*k_all)->ne[0], 1, pad), 0.0f);
+    // CUDA fill supports F32/F16, not quantized cache types. Keep the native
+    // F16 path unchanged; use F32 as the source for quantized padding because
+    // CUDA's copy kernel supports F32 -> Q8_0 without a CPU graph split.
+    const ggml_type fill_type = (*k_all)->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    ggml_tensor * kz_fill = ggml_fill(ctx,
+            ggml_new_tensor_3d(ctx, fill_type, (*k_all)->ne[0], 1, pad), 0.0f);
+    ggml_tensor * kz = kz_fill;
+    if ((*k_all)->type != fill_type) {
+        kz = ggml_cpy(ctx, kz_fill,
+                ggml_new_tensor_3d(ctx, (*k_all)->type, (*k_all)->ne[0], 1, pad));
+    }
     *k_all = ggml_concat(ctx, *k_all, kz, 2);
     ggml_tensor * mz = dsv4_new_filled_2d(ctx, pad, (*attn_mask)->ne[1], -INFINITY);
     *attn_mask = ggml_concat(ctx, *attn_mask, mz, 0);
@@ -2763,7 +2770,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                             ggml_tensor * comp_rows = ggml_view_2d(ctx0, attn_read,
                                     attn_read->ne[0], nc_idx, attn_read->nb[1], 0);
                             ggml_tensor * kv_sel = ggml_get_rows(ctx0, comp_rows, topk);
-                            kv_sel = ggml_cast(ctx0, kv_sel, GGML_TYPE_F16);
+                            kv_sel = ggml_cast(ctx0, kv_sel, attn_read->type);
                             kv_sel = ggml_reshape_3d(ctx0, kv_sel, attn_read->ne[0], 1, top_k);
                             k_all_t = ccat(k_raw_pair, kv_sel, 2, "gather-k");
                             comp_mask_t = dsv4_new_filled_2d(ctx0, top_k, 1, 0.0f);
@@ -3058,7 +3065,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                                 ggml_tensor * comp_rows = ggml_view_2d(ctx0, attn_k_cache,
                                         attn_k_cache->ne[0], nc_idx, attn_k_cache->nb[1], 0);
                                 ggml_tensor * kv_sel = ggml_get_rows(ctx0, comp_rows, topk); // F32 [ne0, top_k]
-                                kv_sel = ggml_cast(ctx0, kv_sel, GGML_TYPE_F16);
+                                kv_sel = ggml_cast(ctx0, kv_sel, attn_k_cache->type);
                                 kv_sel = ggml_reshape_3d(ctx0, kv_sel, attn_k_cache->ne[0], 1, top_k);
                                 k_all = ggml_concat(ctx0, k_raw, kv_sel, 2);
                                 v_all = k_all;

@@ -3351,27 +3351,23 @@ llama_context * llama_init_from_model(
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
-    // V4 (DeepSeek4) requires fp16 KV cache: V4's standard SWA K cache,
-    // compressed-attention K cache (cache.attn_k), and indexer K cache
-    // (cache.index_k) all share the same `type_k` and must agree in dtype
-    // because src/models/deepseek4.cpp concatenates the SWA K view with the
-    // compressed K view via ggml_concat (which asserts a->type == b->type).
-    // Furthermore, V4's K activations are post-fp8-quantized
-    // (ggml_dsv4_fp8_kv_quantize), and q8_0's single fp16 scale per 32-element
-    // block cannot faithfully reproduce fp8-quantized value distributions --
-    // pinning to q8_0 corrupts decode silently ("=" loops, "Mirror ..."
-    // garbage). Coerce here, before the SPLIT_MODE_TENSOR / FA / V-quant
-    // shared validations below and before the constructor's flash_attn check,
-    // so those validations see the effective fp16 types and won't reject V4
-    // requests with --cache-type-k|v q8_0. See
-    // docs/plans/v4-port-kv-q8-completion.md.
-    if (model->arch == LLM_ARCH_DEEPSEEK4) {
-        if (params.type_k != GGML_TYPE_F16 || params.type_v != GGML_TYPE_F16) {
-            LLAMA_LOG_WARN("DeepSeek4: forcing fp16 KV cache (--cache-type-k|v are ignored for V4 because compressed/indexer K caches require fp16; "
-                           "see docs/plans/v4-port-kv-q8-completion.md)\n");
-            params.type_k = GGML_TYPE_F16;
-            params.type_v = GGML_TYPE_F16;
+    // DeepSeek V4 Q8 has been validated in this fork only with Hadamard
+    // attention rotation disabled. Fail closed rather than silently enabling
+    // an untested cache representation.
+    if (model->arch == LLM_ARCH_DEEPSEEK4 &&
+        (params.type_k != GGML_TYPE_F16 || params.type_v != GGML_TYPE_F16)) {
+        if (params.type_k != GGML_TYPE_Q8_0 || params.type_v != GGML_TYPE_Q8_0) {
+            LLAMA_LOG_ERROR("DeepSeek4 compact KV requires matching q8_0 K and V cache types in this experimental build\n");
+            return nullptr;
         }
+
+        const char * rotation_disable = getenv("LLAMA_ATTN_ROT_DISABLE");
+        if (rotation_disable == nullptr || atoi(rotation_disable) == 0) {
+            LLAMA_LOG_ERROR("DeepSeek4 q8_0 KV requires the validated LLAMA_ATTN_ROT_DISABLE=1 path\n");
+            return nullptr;
+        }
+
+        LLAMA_LOG_WARN("DeepSeek4: experimental q8_0 KV enabled with attention rotation disabled\n");
     }
 
     if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {

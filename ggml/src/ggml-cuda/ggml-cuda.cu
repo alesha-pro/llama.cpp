@@ -5673,13 +5673,29 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return op->type == GGML_TYPE_F32 && (op->src[0]->ne[2]*op->src[0]->ne[3]) <= (1 << 15);
         case GGML_OP_CONCAT:
             {
-                // The runtime kernel (ggml-cuda/concat.cu) supports only same-type
-                // F32/F16. Mirror that contract so the scheduler routes other types
-                // (BF16, quantized, integer, ...) to a backend that handles them
-                // instead of aborting inside the kernel's type assert.
-                return op->src[0]->type == op->src[1]->type &&
-                       op->type == op->src[0]->type &&
-                       (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
+                const ggml_type src0_type = op->src[0]->type;
+                const ggml_type src1_type = op->src[1]->type;
+                const int32_t dim = op->op_params[0];
+                return src0_type == src1_type &&
+                       src0_type == op->type &&
+                       (
+                           (
+                               ggml_is_quantized(src0_type) &&
+                               (
+                                   (dim == 3 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])) ||
+                                   (dim != 3 && ggml_is_contiguous_to_3(op->src[0]) && ggml_is_contiguous_to_3(op->src[1]))
+                               ) &&
+                               op->src[0]->ne[0] % ggml_blck_size(src0_type) == 0 &&
+                               op->src[1]->ne[0] % ggml_blck_size(src0_type) == 0
+                           ) || (
+                               !ggml_is_quantized(src0_type) &&
+                               ggml_blck_size(src0_type) == 1 &&
+                               (ggml_type_size(src0_type) == 1 ||
+                                ggml_type_size(src0_type) == 2 ||
+                                ggml_type_size(src0_type) == 4 ||
+                                ggml_type_size(src0_type) == 8)
+                           )
+                       );
             } break;
         case GGML_OP_CONV_TRANSPOSE_1D:
             {
